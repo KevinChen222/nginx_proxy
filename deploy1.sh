@@ -597,6 +597,7 @@ parse_arguments() {
     for item in "${raw_streams[@]}"; do
         [[ -n $item ]] && add_stream_url "$item"
     done
+    return 0
 }
 
 prompt_interactive_mode() {
