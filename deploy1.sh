@@ -22,16 +22,24 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 SUDO=''
-if [[ $(id -u) -ne 0 ]]; then
-    if ! command -v sudo >/dev/null 2>&1; then
-        echo -e "${RED}错误: 此脚本需要 root 权限，或者系统必须安装 sudo。${NC}" >&2
-        exit 1
-    fi
-    SUDO='sudo'
-fi
-
+ROOT_HOME=$(awk -F: '$3 == 0 {print $6; exit}' /etc/passwd 2>/dev/null || true)
+ROOT_HOME=${ROOT_HOME:-/root}
 BACKUP_DIR='/etc/nginx/backup'
-ACME_SH="${HOME}/.acme.sh/acme.sh"
+ACME_SH="${ROOT_HOME}/.acme.sh/acme.sh"
+ACME_VERSION='3.1.2'
+ACME_ARCHIVE_SHA256='a51511ad0e2912be45125cf189401e4ae776ca1a29d5768f020a1e35a9560186'
+ACME_ARCHIVE_URL="https://github.com/acmesh-official/acme.sh/archive/refs/tags/${ACME_VERSION}.tar.gz"
+
+# These commands are persisted by acme.sh and therefore must be standalone:
+# cron renewals cannot call functions defined only in this deployment script.
+ACME_NGINX_PRE_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl stop nginx; elif command -v service >/dev/null 2>&1 && service nginx stop; then :; elif [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s quit; i=0; while kill -0 "$(cat /run/nginx.pid)" 2>/dev/null && [ "$i" -lt 30 ]; do sleep 1; i=$((i + 1)); done; ! kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; fi'
+ACME_NGINX_POST_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; elif [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then :; else nginx; fi'
+ACME_NGINX_RELOAD_CMD='if [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s reload; elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; else nginx; fi'
+
+# Temporary rollback snapshots for files changed during this invocation.
+declare -a config_tx_targets=()
+declare -a config_tx_backups=()
+declare -a config_tx_existed=()
 
 # Main frontend/upstream values.
 you_domain_full=''
@@ -55,6 +63,7 @@ cf_account_id=''
 domain_to_remove=''
 force_yes='no'
 no_proxy_redirect='no'
+upstream_tls_verify='yes'
 manual_gh_proxy=''
 format_cert_domain=''
 resolver=''
@@ -76,11 +85,42 @@ log_error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 handle_error() {
     local exit_code=$?
     local line_number=${1:-unknown}
+    if declare -F rollback_config_changes >/dev/null 2>&1; then
+        rollback_config_changes || true
+    fi
     echo >&2
     log_error "脚本在第 ${line_number} 行中止，退出码: ${exit_code}"
     exit "$exit_code"
 }
 trap 'handle_error $LINENO' ERR
+
+handle_signal() {
+    local signal_name=$1 exit_code=$2 had_config_changes=no
+    ((${#config_tx_targets[@]})) && had_config_changes=yes
+    if declare -F rollback_config_changes >/dev/null 2>&1; then
+        rollback_config_changes || true
+    fi
+    if [[ $had_config_changes == yes ]] && declare -F restore_nginx_after_rollback >/dev/null 2>&1; then
+        restore_nginx_after_rollback
+    fi
+    if declare -F nginx_is_running >/dev/null 2>&1 && command -v nginx >/dev/null 2>&1 && ! nginx_is_running; then
+        start_nginx || true
+    fi
+    trap - INT TERM
+    log_error "收到 ${signal_name}，已尽力恢复配置与 Nginx。"
+    exit "$exit_code"
+}
+trap 'handle_signal INT 130' INT
+trap 'handle_signal TERM 143' TERM
+
+require_root() {
+    if [[ $(id -u) -ne 0 ]]; then
+        log_error '此脚本必须完整地以 root 身份运行。'
+        log_error "请使用: sudo -H bash '$0' [选项]"
+        exit 1
+    fi
+    export HOME=$ROOT_HOME
+}
 
 show_help() {
     cat <<EOF
@@ -103,8 +143,9 @@ show_help() {
   -R, --resolver <DNS>         指定 Nginx resolver，例如 "1.1.1.1 8.8.8.8"
       --cf-token <TOKEN>       Cloudflare API Token
       --cf-account-id <ID>     Cloudflare Account ID
-      --gh-proxy <URL>         GitHub Raw 加速前缀
+      --gh-proxy <URL>         显式指定 GitHub 加速前缀（下载仍会校验哈希）
       --no-proxy-redirect      不改写未显式配置的普通重定向
+      --no-upstream-tls-verify 不校验 HTTPS 源站证书（仅用于自签名源站）
 
 管理选项:
       --remove <URL>           删除指定前端 URL 的配置
@@ -126,6 +167,116 @@ backup_file() {
     fi
 }
 
+version_at_least() {
+    local current=$1 required=$2
+    [[ $(printf '%s\n%s\n' "$required" "$current" | sort -V | head -n 1) == "$required" ]]
+}
+
+has_systemd() {
+    [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1
+}
+
+nginx_is_running() {
+    [[ -s /run/nginx.pid ]] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null
+}
+
+start_nginx() {
+    if has_systemd; then
+        systemctl start nginx
+        return
+    fi
+    if command -v service >/dev/null 2>&1 && service nginx start; then
+        return
+    fi
+    nginx
+}
+
+reload_or_start_nginx() {
+    if nginx_is_running; then
+        nginx -s reload
+    else
+        start_nginx
+    fi
+}
+
+stage_file_install() {
+    local source=$1 target=$2 backup='' existed=no
+    if [[ -e $target || -L $target ]]; then
+        backup=$(mktemp)
+        cp -a -- "$target" "$backup"
+        existed=yes
+    fi
+    config_tx_targets+=("$target")
+    config_tx_backups+=("$backup")
+    config_tx_existed+=("$existed")
+    cp -- "$source" "$target"
+    [[ $existed == yes ]] || chmod 0644 "$target"
+}
+
+stage_file_removal() {
+    local target=$1 backup
+    backup=$(mktemp)
+    cp -a -- "$target" "$backup"
+    config_tx_targets+=("$target")
+    config_tx_backups+=("$backup")
+    config_tx_existed+=(yes)
+    rm -f -- "$target"
+}
+
+rollback_config_changes() {
+    local i target backup existed status=0
+    ((${#config_tx_targets[@]})) || return 0
+    log_warn '正在回滚本次 Nginx 配置改动...'
+    for ((i=${#config_tx_targets[@]} - 1; i >= 0; i--)); do
+        target=${config_tx_targets[$i]}
+        backup=${config_tx_backups[$i]}
+        existed=${config_tx_existed[$i]}
+        if [[ $existed == yes ]]; then
+            if cp -a -- "$backup" "$target"; then
+                rm -f -- "$backup"
+            else
+                log_error "回滚失败，快照保留在: $backup"
+                status=1
+            fi
+        else
+            rm -f -- "$target" || status=1
+        fi
+    done
+    config_tx_targets=()
+    config_tx_backups=()
+    config_tx_existed=()
+    return "$status"
+}
+
+commit_config_changes() {
+    local backup
+    for backup in "${config_tx_backups[@]}"; do
+        [[ -z $backup ]] || rm -f -- "$backup"
+    done
+    config_tx_targets=()
+    config_tx_backups=()
+    config_tx_existed=()
+}
+
+restore_nginx_after_rollback() {
+    if nginx -t >/dev/null 2>&1; then
+        reload_or_start_nginx || log_warn '配置已回滚，但 Nginx 未能自动重新加载。'
+    else
+        log_error '回滚后 Nginx 配置仍未通过测试，请检查其他站点配置。'
+    fi
+}
+
+cleanup_acme_extract_dir() {
+    local directory resolved
+    directory=$1
+    resolved=$(readlink -m -- "$directory")
+    if [[ $resolved != /tmp/acme-install.* || ! -d $resolved ]]; then
+        log_error "拒绝清理非预期的临时目录: $resolved"
+        return 1
+    fi
+    rm -rf --one-file-system -- "$resolved"
+}
+
 is_in_china() {
     local loc=''
     loc=$(curl -m 3 -fsSL https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | awk -F= '$1=="loc"{print $2; exit}') || true
@@ -133,28 +284,33 @@ is_in_china() {
 }
 
 setup_download_urls() {
-    local raw_host='raw.githubusercontent.com'
-    local url_prefix="https://${raw_host}"
-    local acme_raw="${url_prefix}/acmesh-official/acme.sh/master/acme.sh"
     local effective_proxy=${manual_gh_proxy:-${GH_PROXY:-}}
 
-    if [[ -z $effective_proxy ]] && is_in_china; then
-        effective_proxy='https://gh.llkk.cc/'
-    fi
-    if [[ -n $effective_proxy && $effective_proxy != */ ]]; then
-        effective_proxy="${effective_proxy}/"
-    fi
-
     if [[ -n $effective_proxy ]]; then
-        ACME_INSTALL_URL="${effective_proxy}${acme_raw}"
-        log_info "使用 GitHub 代理: $effective_proxy"
+        if [[ $effective_proxy != https://* || $effective_proxy == *[[:space:]]* || $effective_proxy == *';'* || $effective_proxy == *'{'* || $effective_proxy == *'}'* ]]; then
+            log_error "GitHub 代理必须是安全的 HTTPS URL: $effective_proxy"
+            return 1
+        fi
+        [[ $effective_proxy == */ ]] || effective_proxy="${effective_proxy}/"
+        ACME_INSTALL_URL="${effective_proxy}${ACME_ARCHIVE_URL}"
+        log_info "使用显式指定的 GitHub 代理: $effective_proxy"
     else
-        ACME_INSTALL_URL=$acme_raw
+        ACME_INSTALL_URL=$ACME_ARCHIVE_URL
     fi
 }
 
 has_ipv6() {
     command -v ip >/dev/null 2>&1 && ip -6 addr show scope global 2>/dev/null | grep -q inet6
+}
+
+ipv6_stack_available() {
+    [[ -s /proc/net/if_inet6 ]]
+}
+
+nginx_supports_http2_directive() {
+    local nginx_version
+    nginx_version=$(nginx -v 2>&1 | sed -n 's#.*nginx/\([0-9][0-9.]*\).*#\1#p')
+    [[ -n $nginx_version ]] && version_at_least "$nginx_version" '1.25.1'
 }
 
 get_resolver_host() {
@@ -167,6 +323,94 @@ get_resolver_host() {
     else
         printf '%s\n' '1.1.1.1 8.8.8.8'
     fi
+}
+
+is_valid_ipv4() {
+    local address=$1 octet
+    local -a octets=()
+    [[ $address =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS='.' read -r -a octets <<<"$address"
+    for octet in "${octets[@]}"; do
+        (( 10#$octet <= 255 )) || return 1
+    done
+}
+
+is_valid_ipv6() {
+    local address=$1 left='' right='' part remainder
+    local count=0
+    local -a groups=()
+
+    [[ $address == *:* && $address =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+    if [[ $address == *::* ]]; then
+        remainder=${address#*::}
+        [[ $remainder != *::* ]] || return 1
+        left=${address%%::*}
+        right=$remainder
+    else
+        left=$address
+    fi
+
+    for part in "$left" "$right"; do
+        [[ -n $part ]] || continue
+        IFS=':' read -r -a groups <<<"$part"
+        local group
+        for group in "${groups[@]}"; do
+            [[ $group =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+            ((count += 1))
+        done
+    done
+
+    if [[ $address == *::* ]]; then
+        (( count < 8 ))
+    else
+        (( count == 8 ))
+    fi
+}
+
+is_valid_dns_name() {
+    local name=${1%.} label
+    local -a labels=()
+    [[ -n $name && ${#name} -le 253 ]] || return 1
+    IFS='.' read -r -a labels <<<"$name"
+    ((${#labels[@]} >= 2)) || return 1
+    for label in "${labels[@]}"; do
+        [[ ${#label} -ge 1 && ${#label} -le 63 ]] || return 1
+        [[ $label =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+    done
+}
+
+normalize_resolver_list() {
+    local input=$1 item host port=''
+    local -a normalized=() items=()
+    read -r -a items <<<"$input"
+    for item in "${items[@]}"; do
+        host=$item
+        port=''
+        if [[ $item =~ ^\[([0-9A-Fa-f:]+)\](:([0-9]+))?$ ]]; then
+            host=${BASH_REMATCH[1]}
+            port=${BASH_REMATCH[3]:-}
+            is_valid_ipv6 "$host" || return 1
+            item="[${host}]"
+        elif [[ $item =~ ^(([0-9]{1,3}\.){3}[0-9]{1,3})(:([0-9]+))?$ ]]; then
+            host=${BASH_REMATCH[1]}
+            port=${BASH_REMATCH[4]:-}
+            is_valid_ipv4 "$host" || return 1
+            item=$host
+        else
+            return 1
+        fi
+        if [[ -n $port ]]; then
+            (( port >= 1 && port <= 65535 )) || return 1
+            item="${item}:${port}"
+        fi
+        normalized+=("$item")
+    done
+    ((${#normalized[@]})) || return 1
+    printf '%s\n' "${normalized[*]}"
+}
+
+nginx_regex_escape() {
+    printf '%s' "$1" | sed 's/[][\\.^$*+?(){}|]/\\&/g'
 }
 
 # Prints: protocol|domain|port|path
@@ -191,12 +435,18 @@ parse_url() {
         return 1
     fi
 
-    if [[ $authority =~ ^\[([0-9A-Fa-f:.]+)\](:([0-9]+))?$ ]]; then
-        domain="[${BASH_REMATCH[1]}]"
-        port=${BASH_REMATCH[3]:-}
+    if [[ $authority =~ ^\[([0-9A-Fa-f:]+)\](:([0-9]+))?$ ]]; then
+        local ipv6_address=${BASH_REMATCH[1]}
+        local ipv6_port=${BASH_REMATCH[3]:-}
+        is_valid_ipv6 "$ipv6_address" || return 1
+        domain="[${ipv6_address}]"
+        port=$ipv6_port
     elif [[ $authority =~ ^([A-Za-z0-9._-]+)(:([0-9]+))?$ ]]; then
         domain=${BASH_REMATCH[1]}
         port=${BASH_REMATCH[3]:-}
+        if [[ $domain =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            is_valid_ipv4 "$domain" || return 1
+        fi
     else
         return 1
     fi
@@ -206,12 +456,12 @@ parse_url() {
     fi
 
     if [[ -n $path ]]; then
-        # Paths are supported, but configuration-breaking characters are not.
-        if [[ $path == *\"* || $path == *"'"* || $path == *';'* || $path == *'{'* || $path == *'}'* || $path == *$'\r'* || $path == *$'\n'* ]]; then
-            return 1
-        fi
         path=${path%%\?*}
         path=${path%%\#*}
+        # Paths are inserted into Nginx locations and rewrite replacements.
+        if [[ $path == *[[:space:]]* || $path == *\"* || $path == *"'"* || $path == *';'* || $path == *'{'* || $path == *'}'* || $path == *'$'* || $path == *'\\'* || $path == *$'\r'* || $path == *$'\n'* ]]; then
+            return 1
+        fi
         [[ $path == / ]] && path=''
         while [[ $path == */ && $path != / ]]; do path=${path%/}; done
     fi
@@ -222,7 +472,11 @@ parse_url() {
 is_ip_address() {
     local address=${1#[}
     address=${address%]}
-    [[ $address =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || $address == *:* ]]
+    if [[ $address == *:* ]]; then
+        is_valid_ipv6 "$address"
+    else
+        is_valid_ipv4 "$address"
+    fi
 }
 
 get_default_port() {
@@ -301,7 +555,7 @@ add_stream_url() {
 
 parse_arguments() {
     local temp
-    temp=$(getopt -o y:r:s:m:R:dD:hY --long you-domain:,r-domain:,stream-domain:,cert-domain:,resolver:,parse-cert-domain,dns:,cf-token:,cf-account-id:,gh-proxy:,remove:,yes,no-proxy-redirect,help -n "$(basename "$0")" -- "$@") || exit 1
+    temp=$(getopt -o y:r:s:m:R:dD:hY --long you-domain:,r-domain:,stream-domain:,cert-domain:,resolver:,parse-cert-domain,dns:,cf-token:,cf-account-id:,gh-proxy:,remove:,yes,no-proxy-redirect,no-upstream-tls-verify,help -n "$(basename "$0")" -- "$@") || exit 1
     eval set -- "$temp"
 
     while true; do
@@ -319,6 +573,7 @@ parse_arguments() {
             --remove) domain_to_remove=$2; shift 2 ;;
             -Y|--yes) force_yes=yes; shift ;;
             --no-proxy-redirect) no_proxy_redirect=yes; shift ;;
+            --no-upstream-tls-verify) upstream_tls_verify=no; shift ;;
             -h|--help) show_help; exit 0 ;;
             --) shift; break ;;
             *) log_error "未知参数: $1"; exit 1 ;;
@@ -327,6 +582,13 @@ parse_arguments() {
 
     [[ -n $you_domain_full ]] && process_url_input "$you_domain_full" you
     [[ -n $r_domain_full ]] && process_url_input "$r_domain_full" r
+    if [[ -n $dns_provider && ! $dns_provider =~ ^[A-Za-z0-9_]+$ ]]; then
+        log_error "DNS provider 名称无效: $dns_provider"
+        exit 1
+    fi
+    if [[ -n $cf_token ]]; then
+        log_warn '--cf-token 可能进入 shell 历史；建议改用 CF_Token 环境变量。'
+    fi
 
     # Rebuild the stream arrays from the raw repeated options.
     local -a raw_streams=("${stream_input_urls[@]:-}")
@@ -372,6 +634,7 @@ prompt_interactive_mode() {
 }
 
 prepare_summary_values() {
+    local normalized_resolver='' cert_prefix=''
     if is_ip_address "$you_domain"; then
         format_cert_domain=${you_domain//[\[\]]/}
     elif [[ -n $cert_domain ]]; then
@@ -382,8 +645,28 @@ prepare_summary_values() {
         format_cert_domain=$you_domain
     fi
 
+    if [[ $no_tls != yes ]] && ! is_ip_address "$you_domain" && ! is_valid_dns_name "$format_cert_domain"; then
+        log_error "证书域名无效: $format_cert_domain"
+        return 1
+    fi
+    if [[ $no_tls != yes && $format_cert_domain != "$you_domain" ]] && ! is_ip_address "$you_domain"; then
+        if [[ $you_domain != *."$format_cert_domain" ]]; then
+            log_error "前端域名不属于证书域名: $you_domain / $format_cert_domain"
+            return 1
+        fi
+        cert_prefix=${you_domain%."$format_cert_domain"}
+        if [[ -z $cert_prefix || $cert_prefix == *.* ]]; then
+            log_error "*.${format_cert_domain} 不能覆盖多级前端域名: $you_domain"
+            return 1
+        fi
+    fi
+
     if [[ -n $manual_resolver ]]; then
-        resolver="$manual_resolver valid=60s"
+        normalized_resolver=$(normalize_resolver_list "$manual_resolver") || {
+            log_error "Nginx resolver 无效；只允许 IPv4/IPv6 地址及可选端口: $manual_resolver"
+            return 1
+        }
+        resolver="$normalized_resolver valid=60s"
     else
         resolver=$(get_resolver_host)
         if ! has_ipv6; then
@@ -394,7 +677,7 @@ prepare_summary_values() {
 }
 
 display_summary() {
-    prepare_summary_values
+    prepare_summary_values || return 1
     local front_proto upstream_proto i
     front_proto=$(get_protocol "$no_tls")
     upstream_proto=$(get_protocol "$r_http_frontend")
@@ -422,15 +705,20 @@ install_dependencies() {
     local -a required_packages=()
     local dependencies_ready=yes
     local required_command
-    for required_command in nginx curl socat openssl envsubst; do
+    for required_command in nginx curl socat openssl envsubst tar sha256sum; do
         command -v "$required_command" >/dev/null 2>&1 || dependencies_ready=no
     done
     command -v crontab >/dev/null 2>&1 || dependencies_ready=no
+    if [[ $upstream_tls_verify == yes && ! -r /etc/ssl/certs/ca-certificates.crt ]]; then
+        dependencies_ready=no
+    fi
 
     if [[ $dependencies_ready == yes ]]; then
         log_info "Nginx 和依赖已安装，跳过软件包安装。"
         $SUDO mkdir -p /etc/nginx/conf.d /etc/nginx/certs "$BACKUP_DIR"
-        $SUDO rm -f /etc/nginx/conf.d/default.conf /etc/nginx/sites-enabled/default 2>/dev/null || true
+        if ! nginx_is_running; then
+            start_nginx || log_warn 'Nginx 当前未运行；将在配置完成后再次尝试启动。'
+        fi
         return 0
     fi
 
@@ -443,7 +731,7 @@ install_dependencies() {
 
     if command -v apt-get >/dev/null 2>&1; then
         pm=apt
-        required_packages=(nginx curl ca-certificates socat cron openssl gettext-base)
+        required_packages=(nginx curl ca-certificates socat cron openssl gettext-base tar coreutils)
         $SUDO apt-get update
         $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y "${required_packages[@]}"
     elif command -v dnf >/dev/null 2>&1; then
@@ -469,14 +757,12 @@ install_dependencies() {
 
     log_info "依赖安装完成，包管理器: $pm"
     $SUDO mkdir -p /etc/nginx/conf.d /etc/nginx/certs "$BACKUP_DIR"
-    $SUDO rm -f /etc/nginx/conf.d/default.conf /etc/nginx/sites-enabled/default 2>/dev/null || true
 
-    if command -v systemctl >/dev/null 2>&1; then
+    if has_systemd; then
         $SUDO systemctl enable nginx >/dev/null 2>&1 || true
-        $SUDO systemctl start nginx >/dev/null 2>&1 || true
-    elif command -v rc-service >/dev/null 2>&1; then
-        $SUDO rc-update add nginx default >/dev/null 2>&1 || true
-        $SUDO rc-service nginx start >/dev/null 2>&1 || true
+    fi
+    if ! nginx_is_running; then
+        start_nginx || log_warn 'Nginx 当前未运行；将在配置完成后再次尝试启动。'
     fi
 }
 
@@ -524,33 +810,66 @@ ensure_http_include() {
         return 1
     }
 
-    $SUDO cp "$tmp" "$main_conf"
+    stage_file_install "$tmp" "$main_conf"
     rm -f "$tmp"
     log_success "已向 nginx.conf 添加 /etc/nginx/conf.d/*.conf"
 }
 
 install_acme() {
     [[ $no_tls == yes ]] && return 0
+    local current_version=''
     if [[ -x $ACME_SH ]]; then
-        return 0
+        current_version=$("$ACME_SH" --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | tail -n 1 || true)
+        if [[ -n $current_version ]] && version_at_least "$current_version" "$ACME_VERSION"; then
+            "$ACME_SH" --set-default-ca --server letsencrypt
+            return 0
+        fi
+        log_warn "现有 acme.sh 版本过旧或无法识别，将安装固定版本 ${ACME_VERSION}。"
     fi
 
     setup_download_urls
-    log_info "安装 acme.sh..."
-    local tmp
-    tmp=$(mktemp)
-    if ! curl -fsSL "$ACME_INSTALL_URL" -o "$tmp"; then
-        rm -f "$tmp"
+    log_info "安装 acme.sh ${ACME_VERSION}..."
+    local archive extract_dir source_dir install_status=0
+    archive=$(mktemp)
+    extract_dir=$(mktemp -d /tmp/acme-install.XXXXXXXXXX)
+    if ! curl -fsSL "$ACME_INSTALL_URL" -o "$archive"; then
+        rm -f "$archive"
+        cleanup_acme_extract_dir "$extract_dir"
         log_error "下载 acme.sh 失败: $ACME_INSTALL_URL"
         return 1
     fi
-    sh "$tmp" --install-online
-    rm -f "$tmp"
+    if ! printf '%s  %s\n' "$ACME_ARCHIVE_SHA256" "$archive" | sha256sum -c - >/dev/null; then
+        rm -f "$archive"
+        cleanup_acme_extract_dir "$extract_dir"
+        log_error 'acme.sh 归档 SHA-256 校验失败，拒绝执行。'
+        return 1
+    fi
+    tar -xzf "$archive" -C "$extract_dir"
+    source_dir="$extract_dir/acme.sh-${ACME_VERSION}"
+    [[ -f $source_dir/acme.sh ]] || {
+        rm -f "$archive"
+        cleanup_acme_extract_dir "$extract_dir"
+        log_error 'acme.sh 归档结构无效。'
+        return 1
+    }
+    HOME=$ROOT_HOME sh "$source_dir/acme.sh" --install || install_status=$?
+    rm -f "$archive"
+    cleanup_acme_extract_dir "$extract_dir"
+    (( install_status == 0 )) || return "$install_status"
     "$ACME_SH" --set-default-ca --server letsencrypt
 }
 
 acme_cert_is_issued() {
-    "$ACME_SH" --info -d "$format_cert_domain" --ecc 2>/dev/null | grep -q RealFullChainPath
+    local info cert_path
+    info=$("$ACME_SH" --info -d "$format_cert_domain" --ecc 2>/dev/null || true)
+    cert_path=$(sed -n "s/^Le_RealFullChainPath='\(.*\)'$/\1/p" <<<"$info" | head -n 1)
+    [[ -n $cert_path && -s $cert_path ]]
+}
+
+acme_has_renewal_hooks() {
+    local info
+    info=$("$ACME_SH" --info -d "$format_cert_domain" --ecc 2>/dev/null || true)
+    grep -Eq '^Le_PreHook=.+$' <<<"$info" && grep -Eq '^Le_PostHook=.+$' <<<"$info"
 }
 
 cleanup_stale_acme_record() {
@@ -566,6 +885,8 @@ issue_certificate() {
     local cert_dir="/etc/nginx/certs/${format_cert_domain}"
     local issue_extra=()
     local domain_args=(-d "$format_cert_domain")
+    local cert_exists=no need_issue=yes issue_status=0
+    local -a force_args=()
 
     if is_ip_address "$you_domain"; then
         issue_extra+=(--certificate-profile shortlived --days 6)
@@ -575,18 +896,36 @@ issue_certificate() {
         domain_args+=(-d "*.${format_cert_domain}")
     fi
 
-    if ! acme_cert_is_issued; then
-        cleanup_stale_acme_record
+    if acme_cert_is_issued; then
+        cert_exists=yes
+        need_issue=no
+    fi
+
+    if [[ -z $dns_provider && $cert_exists == yes ]] && ! acme_has_renewal_hooks; then
+        log_warn '现有 standalone 证书缺少续期停启 hook，将强制续签一次以补全。'
+        need_issue=yes
+        force_args+=(--force)
+    fi
+
+    if [[ $need_issue == yes ]]; then
+        [[ $cert_exists == yes ]] || cleanup_stale_acme_record
         log_info "申请证书: $format_cert_domain"
         if [[ -n $dns_provider ]]; then
             if [[ $dns_provider == cf ]]; then
                 [[ -n $cf_token ]] && export CF_Token=$cf_token
                 [[ -n $cf_account_id ]] && export CF_Account_ID=$cf_account_id
-                if [[ (-z ${CF_Token:-} || -z ${CF_Account_ID:-}) && -t 0 ]]; then
-                    read -r -p 'Cloudflare Token: ' CF_Token
-                    read -r -p 'Cloudflare Account ID: ' CF_Account_ID
-                    export CF_Token CF_Account_ID
+                if [[ -z ${CF_Token:-} && -t 0 ]]; then
+                    read -r -s -p 'Cloudflare Token: ' CF_Token
+                    echo
                 fi
+                if [[ -z ${CF_Account_ID:-} && -t 0 ]]; then
+                    read -r -p 'Cloudflare Account ID: ' CF_Account_ID
+                fi
+                if [[ -z ${CF_Token:-} || -z ${CF_Account_ID:-} ]]; then
+                    log_error 'Cloudflare DNS 模式需要 CF_Token 和 CF_Account_ID。'
+                    return 1
+                fi
+                export CF_Token CF_Account_ID
             fi
             "$ACME_SH" --issue --dns "dns_${dns_provider}" "${domain_args[@]}" --keylength ec-256
         else
@@ -595,30 +934,14 @@ issue_certificate() {
                 return 1
             fi
 
-            local nginx_was_running=no
-            if pgrep -x nginx >/dev/null 2>&1; then
-                nginx_was_running=yes
-                log_info "Standalone 验证需要占用 80 端口，暂时停止 Nginx。"
-                if command -v systemctl >/dev/null 2>&1; then
-                    $SUDO systemctl stop nginx
-                elif command -v rc-service >/dev/null 2>&1; then
-                    $SUDO rc-service nginx stop
-                else
-                    $SUDO nginx -s stop || true
-                fi
+            log_info 'Standalone 验证会临时停止 Nginx，并为后续续期保存相同的停启 hook。'
+            "$ACME_SH" --issue --standalone "${domain_args[@]}" --keylength ec-256 \
+                --pre-hook "$ACME_NGINX_PRE_HOOK" \
+                --post-hook "$ACME_NGINX_POST_HOOK" \
+                "${issue_extra[@]}" "${force_args[@]}" || issue_status=$?
+            if ! nginx_is_running; then
+                start_nginx || log_warn '证书签发结束后未能自动恢复 Nginx。'
             fi
-
-            local issue_status=0
-            "$ACME_SH" --issue --standalone "${domain_args[@]}" --keylength ec-256 "${issue_extra[@]}" || issue_status=$?
-
-            if [[ $nginx_was_running == yes ]]; then
-                if command -v systemctl >/dev/null 2>&1; then
-                    $SUDO systemctl start nginx || true
-                elif command -v rc-service >/dev/null 2>&1; then
-                    $SUDO rc-service nginx start || true
-                fi
-            fi
-
             (( issue_status == 0 )) || return "$issue_status"
         fi
     fi
@@ -627,7 +950,7 @@ issue_certificate() {
     "$ACME_SH" --install-cert -d "$format_cert_domain" --ecc \
         --fullchain-file "$cert_dir/cert" \
         --key-file "$cert_dir/key" \
-        --reloadcmd "$SUDO nginx -s reload"
+        --reloadcmd "$ACME_NGINX_RELOAD_CMD"
 }
 
 nginx_quote_escape() {
@@ -651,8 +974,8 @@ append_stream_sub_filters() {
     local i public_prefix escaped_public_prefix origin origin_no_default escaped_origin escaped_origin_no_default
     while IFS= read -r i; do
         [[ -n $i ]] || continue
-        public_prefix="\$scheme://\$server_name:\$server_port/__emby_stream/$((i + 1))"
-        escaped_public_prefix="\$scheme:\\/\\/\$server_name:\$server_port\/__emby_stream\/$((i + 1))"
+        public_prefix="\$scheme://\$emby_public_host:\$server_port/__emby_stream/$((i + 1))"
+        escaped_public_prefix="\$scheme:\\/\\/\$emby_public_host:\$server_port\/__emby_stream\/$((i + 1))"
         origin=$(nginx_quote_escape "${stream_origins[$i]}")
         origin_no_default=$(nginx_quote_escape "${stream_origins_no_default_port[$i]}")
         escaped_origin=${origin//\//\\/}
@@ -676,7 +999,7 @@ append_stream_proxy_redirects() {
         [[ -n $i ]] || continue
         origin=$(nginx_quote_escape "${stream_origins[$i]}")
         origin_no_default=$(nginx_quote_escape "${stream_origins_no_default_port[$i]}")
-        public_prefix="\$scheme://\$server_name:\$server_port/__emby_stream/$((i + 1))"
+        public_prefix="\$scheme://\$emby_public_host:\$server_port/__emby_stream/$((i + 1))"
         {
             printf "        proxy_redirect '%s/' '%s/';\n" "$origin" "$public_prefix"
             if [[ $origin_no_default != "$origin" ]]; then
@@ -701,6 +1024,13 @@ append_common_proxy_headers() {
         proxy_send_timeout 3600s;
         proxy_read_timeout 3600s;
 EOF
+    if [[ $upstream_tls_verify == yes ]]; then
+        cat >> "$file" <<'EOF'
+        proxy_ssl_verify on;
+        proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+        proxy_ssl_verify_depth 5;
+EOF
+    fi
 }
 
 append_body_filter_preamble() {
@@ -721,14 +1051,17 @@ generate_nginx_config() {
     ensure_http_include
 
     local map_conf=/etc/nginx/conf.d/00-emby-connection-map.conf
-    cat > /tmp/00-emby-connection-map.conf <<'EOF'
+    local map_tmp
+    map_tmp=$(mktemp)
+    cat > "$map_tmp" <<'EOF'
 map $http_upgrade $emby_connection_upgrade {
     default upgrade;
     ''      close;
 }
 EOF
-    $SUDO cp /tmp/00-emby-connection-map.conf "$map_conf"
-    rm -f /tmp/00-emby-connection-map.conf
+    backup_file "$map_conf"
+    stage_file_install "$map_tmp" "$map_conf"
+    rm -f "$map_tmp"
 
     local clean_domain=${you_domain//[\[\]]/}
     local conf_path="/etc/nginx/conf.d/${clean_domain}.${you_frontend_port}.conf"
@@ -737,6 +1070,9 @@ EOF
 
     local front_path=${you_domain_path:-/}
     [[ $front_path == */ ]] || front_path="${front_path}/"
+    local front_exact=${front_path%/}
+    local front_path_regex
+    front_path_regex=$(nginx_regex_escape "$front_path")
 
     local main_proto main_authority main_upstream main_base_path
     main_proto=$(get_protocol "$r_http_frontend")
@@ -744,18 +1080,32 @@ EOF
     main_base_path=${r_domain_path:-}
     main_upstream="${main_proto}://${main_authority}"
 
+    local modern_http2=no
+    nginx_supports_http2_directive && modern_http2=yes
+
     {
         echo '# Generated by deploy-stream-domains.sh'
         echo '# Main upstream and fixed streaming upstreams are explicitly listed.'
         echo 'server {'
         if [[ $no_tls == yes ]]; then
             echo "    listen ${you_frontend_port};"
-            echo "    listen [::]:${you_frontend_port};"
+            ipv6_stack_available && echo "    listen [::]:${you_frontend_port};"
         else
-            echo "    listen ${you_frontend_port} ssl http2;"
-            echo "    listen [::]:${you_frontend_port} ssl http2;"
+            if [[ $modern_http2 == yes ]]; then
+                echo "    listen ${you_frontend_port} ssl;"
+                ipv6_stack_available && echo "    listen [::]:${you_frontend_port} ssl;"
+                echo '    http2 on;'
+            else
+                echo "    listen ${you_frontend_port} ssl http2;"
+                ipv6_stack_available && echo "    listen [::]:${you_frontend_port} ssl http2;"
+            fi
         fi
-        echo "    server_name ${you_domain};"
+        if [[ $you_domain == \[*\] ]]; then
+            echo '    server_name _;'
+        else
+            echo "    server_name ${you_domain};"
+        fi
+        echo "    set \$emby_public_host '${you_domain}';"
         echo
         if [[ $no_tls != yes ]]; then
             echo "    ssl_certificate /etc/nginx/certs/${format_cert_domain}/cert;"
@@ -786,7 +1136,7 @@ EOF
             echo "    # Streaming upstream ${id}: ${stream_origins[$i]}"
             echo "    location ^~ /__emby_stream/${id}/ {"
             echo "        set \$stream_upstream_${id} '${upstream}';"
-            echo "        rewrite ^/__emby_stream/${id}/(.*)\$ ${base_path}/\$1 break;"
+            echo "        rewrite ^/__emby_stream/${id}/(.*)\$ \"${base_path}/\$1\" break;"
             echo "        proxy_pass \$stream_upstream_${id};"
             echo '        proxy_set_header Host $proxy_host;'
         } >> "$tmp_conf"
@@ -809,12 +1159,18 @@ EOF
 
     # Main Emby login/API location.
     {
-        echo "    location ${front_path} {"
+        if [[ $front_path != / ]]; then
+            echo "    location = \"${front_exact}\" {"
+            echo "        return 308 \"${front_exact}/\$is_args\$args\";"
+            echo '    }'
+            echo
+        fi
+        echo "    location \"${front_path}\" {"
         echo "        set \$emby_main_upstream '${main_upstream}';"
         if [[ $front_path != / ]]; then
-            echo "        rewrite ^${front_path}(.*)\$ ${main_base_path}/\$1 break;"
+            echo "        rewrite ^${front_path_regex}(.*)\$ \"${main_base_path}/\$1\" break;"
         elif [[ -n $main_base_path ]]; then
-            echo "        rewrite ^/(.*)\$ ${main_base_path}/\$1 break;"
+            echo "        rewrite ^/(.*)\$ \"${main_base_path}/\$1\" break;"
         fi
         echo '        proxy_pass $emby_main_upstream;'
         echo '        proxy_set_header Host $proxy_host;'
@@ -833,9 +1189,9 @@ EOF
             main_origin_no_port="${main_proto}://${r_domain}${main_base_path}"
         fi
         {
-            printf "        proxy_redirect '%s/' '\$scheme://\$server_name:\$server_port%s/';\n" "$main_origin" "${front_path%/}"
+            printf "        proxy_redirect '%s/' '\$scheme://\$emby_public_host:\$server_port%s/';\n" "$main_origin" "${front_path%/}"
             if [[ $main_origin_no_port != "$main_origin" ]]; then
-                printf "        proxy_redirect '%s/' '\$scheme://\$server_name:\$server_port%s/';\n" "$main_origin_no_port" "${front_path%/}"
+                printf "        proxy_redirect '%s/' '\$scheme://\$emby_public_host:\$server_port%s/';\n" "$main_origin_no_port" "${front_path%/}"
             fi
         } >> "$tmp_conf"
     fi
@@ -846,7 +1202,7 @@ EOF
     } >> "$tmp_conf"
 
     backup_file "$conf_path"
-    $SUDO cp "$tmp_conf" "$conf_path"
+    stage_file_install "$tmp_conf" "$conf_path"
     rm -f "$tmp_conf"
     log_success "配置文件已生成: $conf_path"
 }
@@ -856,13 +1212,7 @@ test_and_reload_nginx() {
     if ! $SUDO nginx -t; then
         return 1
     fi
-    if command -v systemctl >/dev/null 2>&1; then
-        $SUDO systemctl restart nginx
-    elif command -v rc-service >/dev/null 2>&1; then
-        $SUDO rc-service nginx restart
-    else
-        $SUDO nginx -s reload
-    fi
+    reload_or_start_nginx
 }
 
 remove_domain_config() {
@@ -881,6 +1231,10 @@ remove_domain_config() {
         log_error "未找到配置: $conf_path"
         exit 1
     fi
+    if ! $SUDO grep -q '^# Generated by deploy-stream-domains.sh$' "$conf_path"; then
+        log_error "拒绝删除非本脚本生成的配置: $conf_path"
+        exit 1
+    fi
 
     if [[ $force_yes != yes ]]; then
         if [[ ! -t 0 ]]; then
@@ -892,16 +1246,36 @@ remove_domain_config() {
         [[ $answer == yes ]] || { log_info '已取消。'; exit 0; }
     fi
 
-    local cert_path cert_dir cert_name refs
+    local cert_path cert_dir='' cert_dir_real='' cert_path_real='' cert_root cert_name refs
     cert_path=$($SUDO awk '/ssl_certificate[[:space:]]+/ {gsub(/;/, "", $2); print $2; exit}' "$conf_path")
-    $SUDO rm -f "$conf_path"
+    if [[ -n $cert_path ]]; then
+        cert_root=$(readlink -m /etc/nginx/certs)
+        cert_path_real=$(readlink -m -- "$cert_path")
+        cert_dir_real=$(dirname "$cert_path_real")
+        if [[ $(dirname "$cert_dir_real") != "$cert_root" || $(basename "$cert_path_real") != cert ]]; then
+            log_error "证书路径不在受管目录中，拒绝删除: $cert_path"
+            exit 1
+        fi
+        cert_dir=$cert_dir_real
+        cert_name=$(basename "$cert_dir_real")
+    fi
+
+    stage_file_removal "$conf_path"
+    if ! test_and_reload_nginx; then
+        rollback_config_changes || true
+        restore_nginx_after_rollback
+        log_error '删除后的 Nginx 配置测试或加载失败，已恢复原配置。'
+        exit 1
+    fi
+    commit_config_changes
 
     if [[ -n $cert_path ]]; then
-        cert_dir=$(dirname "$cert_path")
-        cert_name=$(basename "$cert_dir")
         refs=$($SUDO grep -RslF "$cert_path" /etc/nginx/conf.d 2>/dev/null || true)
         if [[ -z $refs ]]; then
-            $SUDO rm -rf "$cert_dir"
+            $SUDO rm -f -- "$cert_dir/cert" "$cert_dir/key"
+            if ! $SUDO rmdir -- "$cert_dir" 2>/dev/null; then
+                log_warn "证书目录中仍有其他文件，未递归删除: $cert_dir"
+            fi
             if [[ -x $ACME_SH ]]; then
                 "$ACME_SH" --remove -d "$cert_name" --ecc >/dev/null 2>&1 || true
             fi
@@ -910,7 +1284,6 @@ remove_domain_config() {
         fi
     fi
 
-    test_and_reload_nginx
     log_success '配置已移除。'
 }
 
@@ -925,6 +1298,7 @@ validate_nginx_features() {
 
 main() {
     parse_arguments "$@"
+    require_root
 
     if [[ -n $domain_to_remove ]]; then
         remove_domain_config
@@ -940,12 +1314,15 @@ main() {
     generate_nginx_config
 
     if test_and_reload_nginx; then
+        commit_config_changes
         local protocol
         protocol=$(get_protocol "$no_tls")
         log_success '部署成功！'
         echo -e "${GREEN}访问地址: ${protocol}://${you_domain}:${you_frontend_port}${you_domain_path}${NC}"
     else
-        log_error 'Nginx 配置测试失败。请检查 /etc/nginx/conf.d/ 下的配置和错误日志。'
+        rollback_config_changes || true
+        restore_nginx_after_rollback
+        log_error 'Nginx 配置测试或加载失败，本次配置改动已回滚。'
         exit 1
     fi
 }
