@@ -282,7 +282,7 @@ add_stream_url() {
         no_default_origin="${proto}://${domain}${path}"
     fi
 
-    for existing in "${stream_origins[@]}"; do
+    for existing in "${stream_origins[@]:-}"; do
         if [[ $existing == "$origin" ]]; then
             log_warn "推流源站已存在，跳过重复项: $origin"
             return 0
@@ -329,14 +329,12 @@ parse_arguments() {
     [[ -n $r_domain_full ]] && process_url_input "$r_domain_full" r
 
     # Rebuild the stream arrays from the raw repeated options.
-    local -a raw_streams=("${stream_input_urls[@]}")
+    local -a raw_streams=("${stream_input_urls[@]:-}")
     stream_input_urls=()
     local item
     for item in "${raw_streams[@]}"; do
         [[ -n $item ]] && add_stream_url "$item"
     done
-
-    return 0
 }
 
 prompt_interactive_mode() {
