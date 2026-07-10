@@ -909,7 +909,12 @@ issue_certificate() {
     fi
 
     if [[ $need_issue == yes ]]; then
-        [[ $cert_exists == yes ]] || cleanup_stale_acme_record
+        if [[ $cert_exists != yes ]]; then
+            cleanup_stale_acme_record
+            # acme.sh --remove intentionally keeps an existing domain key.
+            # A recovery issue must explicitly allow reusing/overwriting it.
+            force_args+=(--force)
+        fi
         log_info "申请证书: $format_cert_domain"
         if [[ -n $dns_provider ]]; then
             if [[ $dns_provider == cf ]]; then
@@ -928,7 +933,8 @@ issue_certificate() {
                 fi
                 export CF_Token CF_Account_ID
             fi
-            "$ACME_SH" --issue --dns "dns_${dns_provider}" "${domain_args[@]}" --keylength ec-256
+            "$ACME_SH" --issue --dns "dns_${dns_provider}" "${domain_args[@]}" --keylength ec-256 \
+                "${force_args[@]}"
         else
             if [[ $format_cert_domain != "$you_domain" ]] && ! is_ip_address "$you_domain"; then
                 log_error "泛域名证书必须通过 -D 指定 DNS API 模式。"
