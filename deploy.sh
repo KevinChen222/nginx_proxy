@@ -2,6 +2,7 @@
 
 # Nginx Emby reverse-proxy deployment script.
 #
+# Build: 2026.07.28-r3 (sysctl-only-ipv6-detection)
 # IPv4/IPv6 fixes in this revision:
 #   1. Detects the frontend address family from A/AAAA records.
 #   2. Supports explicit --listen-mode auto|ipv4|ipv6|dual.
@@ -18,6 +19,10 @@
 # upstream design. It does not create a user-controlled open proxy endpoint.
 
 set -Eeuo pipefail
+
+SCRIPT_NAME='nginx-proxy-ipv6-fixed'
+SCRIPT_VERSION='2026.07.28-r3'
+SCRIPT_BUILD='sysctl-only-ipv6-detection'
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -154,6 +159,7 @@ show_help() {
 管理与测试:
       --remove <URL>           删除指定前端 URL 的配置
   -Y, --yes                    非交互删除时自动确认
+      --version                Print the script build identifier
       --self-test              运行不联网的内置逻辑和 Nginx 语法测试
   -h, --help                   显示帮助
 
@@ -341,7 +347,28 @@ is_ip_address() {
 }
 
 ipv6_stack_available() {
-    [[ -s /proc/net/if_inet6 ]]
+    # Do not use a procfs address-table file to decide whether the IPv6
+    # kernel stack is available. Kernel support and address assignment are
+    # separate states. Use the kernel IPv6 sysctl switch only.
+    local disable_file='/proc/sys/net/ipv6/conf/all/disable_ipv6'
+    local disabled=''
+
+    [[ -d /proc/sys/net/ipv6 ]] || return 1
+    [[ -r $disable_file ]] || return 1
+    disabled=$(<"$disable_file")
+    [[ $disabled == 0 ]]
+}
+
+ipv6_stack_diagnostics() {
+    local proc_sys=no all_state=missing default_state=missing lo_state=missing ip6_link=unknown
+    [[ -d /proc/sys/net/ipv6 ]] && proc_sys=yes
+    [[ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ]] && all_state=$(< /proc/sys/net/ipv6/conf/all/disable_ipv6)
+    [[ -r /proc/sys/net/ipv6/conf/default/disable_ipv6 ]] && default_state=$(< /proc/sys/net/ipv6/conf/default/disable_ipv6)
+    [[ -r /proc/sys/net/ipv6/conf/lo/disable_ipv6 ]] && lo_state=$(< /proc/sys/net/ipv6/conf/lo/disable_ipv6)
+    if command -v ip >/dev/null 2>&1; then
+        if ip -6 link show >/dev/null 2>&1; then ip6_link=ok; else ip6_link=failed; fi
+    fi
+    log_error "IPv6 diagnostics: proc_sys=${proc_sys}, all.disable_ipv6=${all_state}, default.disable_ipv6=${default_state}, lo.disable_ipv6=${lo_state}, ip6_link=${ip6_link}"
 }
 
 has_global_ipv6() {
@@ -553,6 +580,7 @@ detect_frontend_listen_mode() {
     case $frontend_listen_mode in
         ipv6|dual)
             if [[ ${DEPLOY_SELF_TEST:-no} != yes ]] && ! ipv6_stack_available; then
+                ipv6_stack_diagnostics
                 log_error '系统 IPv6 栈不可用，不能启用 IPv6 监听。'
                 return 1
             fi
@@ -632,7 +660,7 @@ prepare_summary_values() {
 
 parse_arguments() {
     local temp
-    temp=$(getopt -o y:r:s:m:R:dD:hY --long you-domain:,r-domain:,stream-domain:,cert-domain:,resolver:,parse-cert-domain,dns:,cf-token:,cf-account-id:,gh-proxy:,listen-mode:,remove:,yes,no-proxy-redirect,no-upstream-tls-verify,self-test,help -n "$(basename "$0")" -- "$@") || exit 1
+    temp=$(getopt -o y:r:s:m:R:dD:hY --long you-domain:,r-domain:,stream-domain:,cert-domain:,resolver:,parse-cert-domain,dns:,cf-token:,cf-account-id:,gh-proxy:,listen-mode:,remove:,yes,no-proxy-redirect,no-upstream-tls-verify,self-test,version,help -n "$(basename "$0")" -- "$@") || exit 1
     eval set -- "$temp"
     while true; do
         case $1 in
@@ -652,6 +680,7 @@ parse_arguments() {
             --no-proxy-redirect) no_proxy_redirect=yes; shift ;;
             --no-upstream-tls-verify) upstream_tls_verify=no; shift ;;
             --self-test) self_test_requested=yes; shift ;;
+            --version) printf '%s %s (%s)\n' "$SCRIPT_NAME" "$SCRIPT_VERSION" "$SCRIPT_BUILD"; exit 0 ;;
             -h|--help) show_help; exit 0 ;;
             --) shift; break ;;
             *) log_error "未知参数: $1"; exit 1 ;;
@@ -1238,7 +1267,14 @@ assert_eq() {
 
 self_test() {
     export DEPLOY_SELF_TEST=yes
+    printf 'SCRIPT_VERSION=%s\n' "$SCRIPT_VERSION"
     local parsed tmp args_text
+    if [[ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ]] && [[ $(< /proc/sys/net/ipv6/conf/all/disable_ipv6) == 0 ]]; then
+        ipv6_stack_available
+        printf 'PASS: IPv6 stack detection uses sysctl state only
+'
+    fi
+
     parsed=$(parse_url 'https://[2001:db8::10]:8443/emby')
     assert_eq 'https|[2001:db8::10]|8443|/emby' "$parsed" '解析 IPv6 URL'
     parsed=$(parse_url 'https://emby.example.com:443')
@@ -1299,6 +1335,7 @@ main() {
     parse_arguments "$@"
     if [[ $self_test_requested == yes ]]; then self_test; exit 0; fi
     require_root
+    log_info "Script version: ${SCRIPT_NAME} ${SCRIPT_VERSION} (${SCRIPT_BUILD})"
     if [[ -n $domain_to_remove ]]; then remove_domain_config; exit 0; fi
     prompt_interactive_mode
     [[ -n $you_domain && -n $r_domain ]] || { log_error '前端和主源站不能为空。'; exit 1; }
