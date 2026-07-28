@@ -21,8 +21,8 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME='nginx-proxy-ipv6-fixed'
-SCRIPT_VERSION='2026.07.28-r3'
-SCRIPT_BUILD='sysctl-only-ipv6-detection'
+SCRIPT_VERSION='2026.07.28-r4'
+SCRIPT_BUILD='socket-option-compatible-listen'
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -911,11 +911,11 @@ write_listen_directives() {
             printf '    listen 0.0.0.0:%s%s;\n' "$port" "$suffix" >> "$file"
             ;;
         ipv6)
-            printf '    listen [::]:%s%s ipv6only=on;\n' "$port" "$suffix" >> "$file"
+            printf '    listen [::]:%s%s;\n' "$port" "$suffix" >> "$file"
             ;;
         dual)
             printf '    listen 0.0.0.0:%s%s;\n' "$port" "$suffix" >> "$file"
-            printf '    listen [::]:%s%s ipv6only=on;\n' "$port" "$suffix" >> "$file"
+            printf '    listen [::]:%s%s;\n' "$port" "$suffix" >> "$file"
             ;;
         *) log_error "未知监听模式: $frontend_listen_mode"; return 1 ;;
     esac
@@ -1304,7 +1304,7 @@ self_test() {
     frontend_listen_mode=ipv6
     : > "$tmp/listen.conf"
     write_listen_directives "$tmp/listen.conf" 443 yes no
-    grep -Fq 'listen [::]:443 ssl http2 ipv6only=on;' "$tmp/listen.conf"
+    grep -Fq 'listen [::]:443 ssl http2;' "$tmp/listen.conf"
     ! grep -Fq '0.0.0.0' "$tmp/listen.conf"
     printf 'PASS: IPv6-only Nginx 监听不含 IPv4\n'
 
@@ -1324,6 +1324,24 @@ EOF_TEST_NGINX
     if command -v nginx >/dev/null 2>&1; then
         nginx -t -c "$tmp/nginx.conf" -p "$tmp" >/dev/null
         printf 'PASS: 双栈 Nginx 配置语法\n'
+
+        cat > "$tmp/shared-listen.conf" <<'EOF_TEST_SHARED'
+events {}
+http {
+    server {
+        listen [::]:18443 default_server reuseport;
+        server_name _;
+        return 444;
+    }
+    server {
+        listen [::]:18443;
+        server_name ipv6.example.test;
+        return 200;
+    }
+}
+EOF_TEST_SHARED
+        nginx -t -c "$tmp/shared-listen.conf" -p "$tmp" >/dev/null
+        printf 'PASS: 与现有 reuseport/default_server IPv6 监听兼容\n'
     else
         printf 'SKIP: 未安装 Nginx，跳过 Nginx 语法测试\n'
     fi
