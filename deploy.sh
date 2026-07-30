@@ -2,7 +2,7 @@
 
 # Nginx Emby reverse-proxy deployment script.
 #
-# Build: 2026.07.28-r3 (sysctl-only-ipv6-detection)
+# Build: 2026.07.30-r5 (upstream-alt-svc-filter)
 # IPv4/IPv6 fixes in this revision:
 #   1. Detects the frontend address family from A/AAAA records.
 #   2. Supports explicit --listen-mode auto|ipv4|ipv6|dual.
@@ -21,8 +21,8 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME='nginx-proxy-ipv6-fixed'
-SCRIPT_VERSION='2026.07.28-r4'
-SCRIPT_BUILD='socket-option-compatible-listen'
+SCRIPT_VERSION='2026.07.30-r5'
+SCRIPT_BUILD='upstream-alt-svc-filter'
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -1064,6 +1064,8 @@ append_common_proxy_headers() {
     cat >> "$file" <<'EOF_HEADERS'
         proxy_http_version 1.1;
         proxy_ssl_server_name on;
+        # Do not advertise an upstream's HTTP/3 endpoint as this proxy origin.
+        proxy_hide_header Alt-Svc;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $emby_connection_upgrade;
         proxy_set_header X-Real-IP $remote_addr;
@@ -1301,6 +1303,13 @@ self_test() {
     assert_eq dual "$frontend_listen_mode" 'A+AAAA 自动识别为双栈'
 
     tmp=$(mktemp -d)
+
+    upstream_tls_verify=no
+    : > "$tmp/proxy-headers.conf"
+    append_common_proxy_headers "$tmp/proxy-headers.conf"
+    grep -Fq 'proxy_hide_header Alt-Svc;' "$tmp/proxy-headers.conf"
+    printf 'PASS: 过滤上游 Alt-Svc，避免错误宣传 HTTP/3\n'
+
     frontend_listen_mode=ipv6
     : > "$tmp/listen.conf"
     write_listen_directives "$tmp/listen.conf" 443 yes no
