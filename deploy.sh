@@ -2,7 +2,7 @@
 
 # Nginx Emby reverse-proxy deployment script.
 #
-# Build: 2026.07.30-r5 (upstream-alt-svc-filter)
+# Build: 2026.08.05-r6 (dns-public-fallback)
 # IPv4/IPv6 fixes in this revision:
 #   1. Detects the frontend address family from A/AAAA records.
 #   2. Supports explicit --listen-mode auto|ipv4|ipv6|dual.
@@ -14,6 +14,10 @@
 #      instead of unconditionally adding IPv4 plus IPv6 listeners.
 #   7. The selected validation mode and family are persisted by acme.sh,
 #      so automatic renewals use the same working method.
+#   8. DNS detection first uses the system resolver, then retries through
+#      Cloudflare and Google public DNS/DoH when the local resolver is stale.
+#   9. If every DNS query fails, auto mode no longer aborts immediately; it
+#      falls back to the server network capability, preferring IPv4.
 #
 # The script keeps the original main-upstream and multiple fixed streaming
 # upstream design. It does not create a user-controlled open proxy endpoint.
@@ -21,8 +25,8 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME='nginx-proxy-ipv6-fixed'
-SCRIPT_VERSION='2026.07.30-r5'
-SCRIPT_BUILD='upstream-alt-svc-filter'
+SCRIPT_VERSION='2026.08.05-r6'
+SCRIPT_BUILD='dns-public-fallback'
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -376,7 +380,7 @@ has_global_ipv6() {
 }
 
 has_ipv4_interface() {
-    command -v ip >/dev/null 2>&1 && ip -4 -o addr show 2>/dev/null | grep -q ' inet '
+    command -v ip >/dev/null 2>&1 && ip -4 -o addr show scope global 2>/dev/null | grep -q ' inet '
 }
 
 nginx_supports_http2_directive() {
@@ -518,32 +522,165 @@ normalize_resolver_list() {
     printf '%s\n' "${normalized[*]}"
 }
 
+filter_dns_answers() {
+    local record_type=$1
+    case $record_type in
+        A)
+            awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}$/' | sort -u
+            ;;
+        AAAA)
+            awk '/^[0-9A-Fa-f:]+(%[A-Za-z0-9_.-]+)?$/' | sort -u
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+query_dns_with_dig() {
+    local name=$1 record_type=$2 nameserver=${3:-}
+    local -a args=(+time=2 +tries=1 +retry=0 +short)
+    if [[ -n $nameserver ]]; then
+        dig "@${nameserver}" "${args[@]}" "$record_type" "$name" 2>/dev/null | filter_dns_answers "$record_type"
+    else
+        dig "${args[@]}" "$record_type" "$name" 2>/dev/null | filter_dns_answers "$record_type"
+    fi
+}
+
+query_dns_with_nslookup() {
+    local name=$1 record_type=$2 nameserver=${3:-}
+    local output=''
+    if [[ -n $nameserver ]]; then
+        output=$(nslookup -type="$record_type" "$name" "$nameserver" 2>/dev/null) || true
+    else
+        output=$(nslookup -type="$record_type" "$name" 2>/dev/null) || true
+    fi
+    case $record_type in
+        A)
+            awk -F': ' '/^Address: / && $2 !~ /#/ {print $2}' <<<"$output" | filter_dns_answers A
+            ;;
+        AAAA)
+            awk -F': ' '/^Address: / && $2 !~ /#/ {print $2}' <<<"$output" | filter_dns_answers AAAA
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+extract_doh_answers() {
+    local record_type=$1
+    # The JSON endpoints may return CNAME and address answers together. Split
+    # every data field onto its own line, then keep only valid address shapes.
+    sed 's/"data"/\n"data"/g' \
+        | sed -n 's/^"data"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        | filter_dns_answers "$record_type"
+}
+
+query_dns_with_doh() {
+    local name=$1 record_type=$2 provider=$3 endpoint resolve_host output=''
+    case $provider in
+        cloudflare)
+            endpoint='https://cloudflare-dns.com/dns-query'
+            resolve_host='cloudflare-dns.com:443:1.1.1.1'
+            ;;
+        google)
+            endpoint='https://dns.google/resolve'
+            resolve_host='dns.google:443:8.8.8.8'
+            ;;
+        *) return 1 ;;
+    esac
+
+    output=$(curl -fsS --connect-timeout 2 --max-time 4 \
+        --resolve "$resolve_host" \
+        -H 'accept: application/dns-json' \
+        --get --data-urlencode "name=${name}" --data-urlencode "type=${record_type}" \
+        "$endpoint" 2>/dev/null) || true
+    [[ -n $output ]] || return 0
+    printf '%s\n' "$output" | extract_doh_answers "$record_type"
+}
+
+resolve_dns_records() {
+    local name=$1 record_type=$2 result='' candidate='' nameserver
+    local -a public_resolvers=(1.1.1.1 8.8.8.8)
+
+    if command -v dig >/dev/null 2>&1; then
+        result=$(query_dns_with_dig "$name" "$record_type") || true
+        if [[ -z $result ]]; then
+            for nameserver in "${public_resolvers[@]}"; do
+                candidate=$(query_dns_with_dig "$name" "$record_type" "$nameserver") || true
+                if [[ -n $candidate ]]; then
+                    result=$candidate
+                    break
+                fi
+            done
+        fi
+    elif command -v nslookup >/dev/null 2>&1; then
+        result=$(query_dns_with_nslookup "$name" "$record_type") || true
+        if [[ -z $result ]]; then
+            for nameserver in "${public_resolvers[@]}"; do
+                candidate=$(query_dns_with_nslookup "$name" "$record_type" "$nameserver") || true
+                if [[ -n $candidate ]]; then
+                    result=$candidate
+                    break
+                fi
+            done
+        fi
+    elif command -v getent >/dev/null 2>&1; then
+        case $record_type in
+            A)
+                result=$(getent ahostsv4 "$name" 2>/dev/null | awk '$2=="STREAM" && $1 ~ /\./ {print $1}' | sort -u) || true
+                ;;
+            AAAA)
+                result=$(getent ahostsv6 "$name" 2>/dev/null | awk '$2=="STREAM" && $1 ~ /:/ && $1 !~ /^::ffff:/ {print $1}' | sort -u) || true
+                ;;
+        esac
+    fi
+
+    # DoH fallback does not depend on /etc/resolv.conf: --resolve pins the
+    # HTTPS hostname to the public resolver IP while preserving TLS SNI.
+    if [[ -z $result ]] && command -v curl >/dev/null 2>&1; then
+        candidate=$(query_dns_with_doh "$name" "$record_type" cloudflare) || true
+        [[ -n $candidate ]] || candidate=$(query_dns_with_doh "$name" "$record_type" google) || true
+        [[ -z $candidate ]] || result=$candidate
+    fi
+
+    printf '%s\n' "$result"
+}
+
 resolve_a_records() {
-    local name=$1 result=''
+    local name=$1
     if [[ -n ${DEPLOY_TEST_DNS_A+x} ]]; then
         printf '%s\n' "$DEPLOY_TEST_DNS_A"
         return 0
     fi
-    if command -v dig >/dev/null 2>&1; then
-        result=$(dig +time=3 +tries=1 +short A "$name" 2>/dev/null | awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}$/') || true
-    elif command -v getent >/dev/null 2>&1; then
-        result=$(getent ahostsv4 "$name" 2>/dev/null | awk '$2=="STREAM" && $1 ~ /\./ {print $1}' | sort -u) || true
-    fi
-    printf '%s\n' "$result"
+    resolve_dns_records "$name" A
 }
 
 resolve_aaaa_records() {
-    local name=$1 result=''
+    local name=$1
     if [[ -n ${DEPLOY_TEST_DNS_AAAA+x} ]]; then
         printf '%s\n' "$DEPLOY_TEST_DNS_AAAA"
         return 0
     fi
-    if command -v dig >/dev/null 2>&1; then
-        result=$(dig +time=3 +tries=1 +short AAAA "$name" 2>/dev/null | awk '/:/') || true
-    elif command -v getent >/dev/null 2>&1; then
-        result=$(getent ahostsv6 "$name" 2>/dev/null | awk '$2=="STREAM" && $1 ~ /:/ && $1 !~ /^::ffff:/ {print $1}' | sort -u) || true
+    resolve_dns_records "$name" AAAA
+}
+
+choose_dns_failure_fallback_mode() {
+    if [[ -n ${DEPLOY_TEST_AUTO_FALLBACK_MODE+x} ]]; then
+        case $DEPLOY_TEST_AUTO_FALLBACK_MODE in
+            ipv4|ipv6) printf '%s\n' "$DEPLOY_TEST_AUTO_FALLBACK_MODE"; return 0 ;;
+            *) return 1 ;;
+        esac
     fi
-    printf '%s\n' "$result"
+
+    # IPv4 is the conservative fallback for an unknown DNS state. It avoids
+    # enabling IPv6/webroot merely because the kernel IPv6 stack exists.
+    if has_ipv4_interface; then
+        printf 'ipv4\n'
+    elif ipv6_stack_available && has_global_ipv6; then
+        printf 'ipv6\n'
+    else
+        # Detection runs before dependency installation; if `ip` is missing,
+        # prefer IPv4 and let the later Nginx/config checks report real errors.
+        printf 'ipv4\n'
+    fi
 }
 
 detect_frontend_listen_mode() {
@@ -571,9 +708,10 @@ detect_frontend_listen_mode() {
         elif [[ -n $frontend_dns_a ]]; then
             frontend_listen_mode=ipv4
         else
-            log_error "未查询到 ${you_domain} 的 A 或 AAAA 记录。"
-            log_error '请先完成 DNS 解析，或显式使用 --listen-mode 指定模式。'
-            return 1
+            frontend_listen_mode=$(choose_dns_failure_fallback_mode)
+            log_warn "系统 DNS 与公共 DNS/DoH 均未查询到 ${you_domain} 的 A/AAAA 记录。"
+            log_warn "auto 模式不再中止，已按本机网络能力临时选择 ${frontend_listen_mode}（优先 IPv4）。"
+            log_warn '这只绕过监听模式检测；如果公网 DNS 实际未生效，HTTP-01 证书申请仍会失败。'
         fi
     fi
 
@@ -1282,6 +1420,9 @@ self_test() {
     parsed=$(parse_url 'https://emby.example.com:443')
     assert_eq 'https|emby.example.com|443|' "$parsed" '解析域名 URL'
 
+    parsed=$(printf '%s' '{"Status":0,"Answer":[{"type":5,"data":"alias.example.com."},{"type":1,"data":"23.238.31.171"}]}' | extract_doh_answers A)
+    assert_eq '23.238.31.171' "$parsed" '解析 DoH JSON 中的 A 记录'
+
     you_domain='v6.example.com'; listen_mode_requested=auto
     DEPLOY_TEST_DNS_A='' DEPLOY_TEST_DNS_AAAA='2001:db8::10' detect_frontend_listen_mode
     assert_eq ipv6 "$frontend_listen_mode" 'AAAA-only 自动识别为 IPv6'
@@ -1301,6 +1442,11 @@ self_test() {
     frontend_dns_a=''; frontend_dns_aaaa=''
     DEPLOY_TEST_DNS_A='192.0.2.10' DEPLOY_TEST_DNS_AAAA='2001:db8::10' detect_frontend_listen_mode
     assert_eq dual "$frontend_listen_mode" 'A+AAAA 自动识别为双栈'
+
+    you_domain='dns-failure.example.com'; listen_mode_requested=auto
+    frontend_dns_a=''; frontend_dns_aaaa=''
+    DEPLOY_TEST_DNS_A='' DEPLOY_TEST_DNS_AAAA='' DEPLOY_TEST_AUTO_FALLBACK_MODE=ipv4 detect_frontend_listen_mode
+    assert_eq ipv4 "$frontend_listen_mode" 'DNS 全部失败时 auto 安全降级为 IPv4'
 
     tmp=$(mktemp -d)
 
