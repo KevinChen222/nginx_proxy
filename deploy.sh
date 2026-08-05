@@ -5,8 +5,8 @@
 # Upstreams are fixed at deployment; no user-controlled open-proxy endpoint.
 set -Eeuo pipefail
 SCRIPT_NAME='nginx-proxy-ipv6-fixed'
-SCRIPT_VERSION='2026.08.05-r6-slim1'
-SCRIPT_BUILD='same-feature-refactor'
+SCRIPT_VERSION='2026.08.05-r6-slim2'
+SCRIPT_BUILD='acme-install-cwd-hotfix'
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -824,7 +824,7 @@ install_acme() {
     else
         source_dir="$extract_dir/acme.sh-${ACME_VERSION}"
         if [[ ! -f $source_dir/acme.sh ]]; then status=1
-        elif HOME=$ROOT_HOME sh "$source_dir/acme.sh" --install; then :
+        elif (cd "$source_dir" && HOME=$ROOT_HOME sh ./acme.sh --install); then :
         else status=$?
         fi
     fi
