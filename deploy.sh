@@ -38,7 +38,7 @@ ACME_NGINX_PRE_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev
 ACME_NGINX_POST_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; elif [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then :; else nginx; fi'
 ACME_NGINX_RELOAD_CMD='if [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s reload; elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; else nginx; fi'
 
-SCRIPT_VERSION='2026.08.21-haproxy1'
+SCRIPT_VERSION='2026.08.21-haproxy3'
 SNI_ROUTER_BIN='/usr/local/bin/sb'
 SNI_ROUTER_API_VERSION='1'
 SNI_ROUTER_OWNER='nginx-proxy'
@@ -990,7 +990,9 @@ install_acme() {
 acme_cert_is_issued() {
     local info cert_path
     info=$("$ACME_SH" --info -d "$format_cert_domain" --ecc 2>/dev/null || true)
-    cert_path=$(sed -n "s/^Le_RealFullChainPath='\(.*\)'$/\1/p" <<<"$info" | head -n 1)
+    cert_path=$(sed -n 's/^Le_RealFullChainPath=//p' <<<"$info" | head -n 1)
+    cert_path=${cert_path#\'}
+    cert_path=${cert_path%\'}
     [[ -n $cert_path && -s $cert_path ]]
 }
 
@@ -1001,9 +1003,12 @@ acme_has_renewal_hooks() {
 }
 
 acme_uses_webroot() {
-    local info
+    local info webroot
     info=$("$ACME_SH" --info -d "$format_cert_domain" --ecc 2>/dev/null || true)
-    grep -Fq "$ACME_WEBROOT" <<<"$info"
+    webroot=$(sed -n 's/^Le_Webroot=//p' <<<"$info" | head -n 1)
+    webroot=${webroot#\'}
+    webroot=${webroot%\'}
+    [[ $webroot == "$ACME_WEBROOT" ]]
 }
 
 prepare_acme_webroot() {
