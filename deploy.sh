@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+# NGINXPROXY_MANAGED_COMMAND=1
+
 # Nginx Emby reverse-proxy deployment script with optional HAProxy SNI sharing.
 # Supports multiple
 # independent streaming/CDN upstream domains.
@@ -38,7 +40,9 @@ ACME_NGINX_PRE_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev
 ACME_NGINX_POST_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; elif [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then :; else nginx; fi'
 ACME_NGINX_RELOAD_CMD='if [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s reload; elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; else nginx; fi'
 
-SCRIPT_VERSION='2026.08.21-haproxy3'
+SCRIPT_VERSION='2026.08.21-haproxy4'
+QUICK_COMMAND_PATH='/usr/local/bin/nginxproxy'
+QUICK_COMMAND_MARKER='# NGINXPROXY_MANAGED_COMMAND=1'
 SNI_ROUTER_BIN='/usr/local/bin/sb'
 SNI_ROUTER_API_VERSION='1'
 SNI_ROUTER_OWNER='nginx-proxy'
@@ -70,6 +74,7 @@ dns_provider=''
 cf_token=''
 cf_account_id=''
 domain_to_remove=''
+install_command_only='no'
 force_yes='no'
 no_proxy_redirect='no'
 upstream_tls_verify='yes'
@@ -157,6 +162,74 @@ require_root() {
     export HOME=$ROOT_HOME
 }
 
+current_script_path() {
+    local source_path=${BASH_SOURCE[0]}
+    [[ -f $source_path ]] || return 1
+    readlink -f -- "$source_path" 2>/dev/null || printf '%s\n' "$source_path"
+}
+
+install_quick_command() {
+    local source_path source_real target_real install_tmp
+    if ! source_path=$(current_script_path); then
+        log_error '当前脚本不是普通本地文件，无法安全安装快捷命令。'
+        log_error '请先下载 deploy.sh，通过 Bash 语法校验后再安装到 /usr/local/bin/nginxproxy。'
+        return 1
+    fi
+
+    if ! grep -Fqx -- "$QUICK_COMMAND_MARKER" "$source_path" || ! bash -n "$source_path"; then
+        log_error '当前脚本缺少管理标记或 Bash 语法校验失败，拒绝安装快捷命令。'
+        return 1
+    fi
+
+    source_real=$(readlink -f -- "$source_path" 2>/dev/null || printf '%s\n' "$source_path")
+    if [[ -L $QUICK_COMMAND_PATH ]]; then
+        log_error "快捷命令路径是符号链接，拒绝覆盖: $QUICK_COMMAND_PATH"
+        return 1
+    fi
+    if [[ -e $QUICK_COMMAND_PATH ]]; then
+        target_real=$(readlink -f -- "$QUICK_COMMAND_PATH" 2>/dev/null || printf '%s\n' "$QUICK_COMMAND_PATH")
+        if [[ $source_real == "$target_real" ]]; then
+            chmod 700 -- "$QUICK_COMMAND_PATH"
+            log_success "快捷命令已就绪: nginxproxy"
+            return 0
+        fi
+        if [[ ! -f $QUICK_COMMAND_PATH ]] || ! grep -Fqx -- "$QUICK_COMMAND_MARKER" "$QUICK_COMMAND_PATH"; then
+            log_error "路径已被其他文件占用，拒绝覆盖: $QUICK_COMMAND_PATH"
+            return 1
+        fi
+    fi
+
+    install_tmp=$(mktemp "${QUICK_COMMAND_PATH}.tmp.XXXXXXXXXX") || return 1
+    if ! install -m 700 -- "$source_path" "$install_tmp" || ! mv -f -- "$install_tmp" "$QUICK_COMMAND_PATH"; then
+        rm -f -- "$install_tmp"
+        log_error "安装快捷命令失败: $QUICK_COMMAND_PATH"
+        return 1
+    fi
+    log_success "快捷命令已安装: nginxproxy"
+}
+
+ensure_quick_command() {
+    if [[ -L $QUICK_COMMAND_PATH ]]; then
+        log_warn "快捷命令路径是符号链接，已跳过自动安装: $QUICK_COMMAND_PATH"
+        return 0
+    fi
+    if [[ -e $QUICK_COMMAND_PATH ]]; then
+        if [[ -f $QUICK_COMMAND_PATH ]] && grep -Fqx -- "$QUICK_COMMAND_MARKER" "$QUICK_COMMAND_PATH"; then
+            chmod 700 -- "$QUICK_COMMAND_PATH" || log_warn "无法修复快捷命令权限: $QUICK_COMMAND_PATH"
+        else
+            log_warn "快捷命令路径已被其他文件占用，已保留原文件: $QUICK_COMMAND_PATH"
+        fi
+        return 0
+    fi
+
+    if [[ ! -f ${BASH_SOURCE[0]} ]]; then
+        log_warn '当前通过管道或进程替换运行，已跳过自动安装 nginxproxy。'
+        return 0
+    fi
+    log_info '正在安装快捷命令 nginxproxy...'
+    install_quick_command || log_warn '快捷命令安装失败，但不会影响本次反代配置。'
+}
+
 show_help() {
     cat <<EOF
 用法: $(basename "$0") [选项]
@@ -186,6 +259,7 @@ show_help() {
       --version                显示脚本版本
 
 管理选项:
+      --install-command        将当前脚本安装为 /usr/local/bin/nginxproxy
       --remove <URL>           删除指定前端 URL 的配置
   -Y, --yes                    非交互删除时自动确认
   -h, --help                   显示帮助
@@ -661,7 +735,7 @@ add_stream_url() {
 
 parse_arguments() {
     local temp
-    temp=$(getopt -o y:r:s:m:R:dD:hY --long you-domain:,r-domain:,stream-domain:,cert-domain:,resolver:,parse-cert-domain,dns:,cf-token:,cf-account-id:,gh-proxy:,remove:,yes,no-proxy-redirect,no-upstream-tls-verify,frontend-mode:,sni-router,version,help -n "$(basename "$0")" -- "$@") || exit 1
+    temp=$(getopt -o y:r:s:m:R:dD:hY --long you-domain:,r-domain:,stream-domain:,cert-domain:,resolver:,parse-cert-domain,dns:,cf-token:,cf-account-id:,gh-proxy:,remove:,yes,no-proxy-redirect,no-upstream-tls-verify,frontend-mode:,sni-router,install-command,version,help -n "$(basename "$0")" -- "$@") || exit 1
     eval set -- "$temp"
 
     while true; do
@@ -682,6 +756,7 @@ parse_arguments() {
             --no-upstream-tls-verify) upstream_tls_verify=no; shift ;;
             --frontend-mode) frontend_mode=${2,,}; frontend_mode_explicit=yes; shift 2 ;;
             --sni-router) frontend_mode=haproxy; frontend_mode_explicit=yes; shift ;;
+            --install-command) install_command_only=yes; shift ;;
             --version) echo "$SCRIPT_VERSION"; exit 0 ;;
             -h|--help) show_help; exit 0 ;;
             --) shift; break ;;
@@ -1560,6 +1635,14 @@ main() {
     parse_arguments "$@"
     require_root
 
+    if [[ $install_command_only == yes ]]; then
+        if ! install_quick_command; then
+            exit 1
+        fi
+        exit 0
+    fi
+    ensure_quick_command
+
     if [[ -n $domain_to_remove ]]; then
         remove_domain_config
         exit 0
@@ -1601,6 +1684,7 @@ main() {
     log_success '部署成功！'
     echo -e "${GREEN}访问地址: ${protocol}://${you_domain}:${you_frontend_port}${you_domain_path}${NC}"
     [[ $frontend_mode == haproxy ]] && echo "公网 :443 -> HAProxy(SNI ${you_domain,,}) -> Nginx ${SNI_ROUTER_BACKEND_HOST}:${SNI_ROUTER_BACKEND_PORT}"
+    [[ -x $QUICK_COMMAND_PATH ]] && echo '后续可直接运行: nginxproxy'
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
