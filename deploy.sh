@@ -40,7 +40,8 @@ ACME_NGINX_PRE_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev
 ACME_NGINX_POST_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; elif [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then :; else nginx; fi'
 ACME_NGINX_RELOAD_CMD='if [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s reload; elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; else nginx; fi'
 
-SCRIPT_VERSION='2026.08.21-haproxy4'
+SCRIPT_VERSION='2026.08.21-haproxy5'
+SCRIPT_DOWNLOAD_URL='https://raw.githubusercontent.com/KevinChen222/nginx_proxy/refs/heads/main/deploy.sh'
 QUICK_COMMAND_PATH='/usr/local/bin/nginxproxy'
 QUICK_COMMAND_MARKER='# NGINXPROXY_MANAGED_COMMAND=1'
 SNI_ROUTER_BIN='/usr/local/bin/sb'
@@ -75,6 +76,7 @@ cf_token=''
 cf_account_id=''
 domain_to_remove=''
 install_command_only='no'
+script_update_performed='no'
 force_yes='no'
 no_proxy_redirect='no'
 upstream_tls_verify='yes'
@@ -170,10 +172,13 @@ current_script_path() {
 
 install_quick_command() {
     local source_path source_real target_real install_tmp
-    if ! source_path=$(current_script_path); then
-        log_error '当前脚本不是普通本地文件，无法安全安装快捷命令。'
-        log_error '请先下载 deploy.sh，通过 Bash 语法校验后再安装到 /usr/local/bin/nginxproxy。'
-        return 1
+    source_path=${1:-}
+    if [[ -z $source_path ]]; then
+        if ! source_path=$(current_script_path); then
+            log_error '当前脚本不是普通本地文件，无法安全安装快捷命令。'
+            log_error '请先下载 deploy.sh，通过 Bash 语法校验后再安装到 /usr/local/bin/nginxproxy。'
+            return 1
+        fi
     fi
 
     if ! grep -Fqx -- "$QUICK_COMMAND_MARKER" "$source_path" || ! bash -n "$source_path"; then
@@ -235,7 +240,7 @@ show_help() {
 用法: $(basename "$0") [选项]
 
 部署一个支持“主 Emby 域名 + 多个独立推流域名”的 Nginx 反向代理。
-不带参数运行时进入交互模式。
+不带参数运行时进入管理菜单，再选择“添加反代”进入原有交互流程。
 
 部署选项:
   -y, --you-domain <URL>       用户访问的反代 URL
@@ -282,6 +287,122 @@ backup_file() {
 version_at_least() {
     local current=$1 required=$2
     [[ $(printf '%s\n%s\n' "$required" "$current" | sort -V | head -n 1) == "$required" ]]
+}
+
+download_script_update() {
+    local destination=$1
+    local update_url="${SCRIPT_DOWNLOAD_URL}?v=$(date +%s)"
+
+    rm -f -- "$destination"
+    if command -v curl >/dev/null 2>&1 && \
+       curl -LfsS --connect-timeout 15 --max-time 120 "$update_url" -o "$destination"; then
+        return 0
+    fi
+    rm -f -- "$destination"
+    if command -v wget >/dev/null 2>&1 && \
+       wget -q --timeout=120 -O "$destination" "$update_url"; then
+        return 0
+    fi
+    rm -f -- "$destination"
+    log_error '脚本下载失败，请检查网络以及 GitHub 连接。'
+    return 1
+}
+
+validate_script_update() {
+    local candidate=$1
+    local candidate_version
+
+    if [[ ! -s $candidate ]] || ! head -n 1 "$candidate" | grep -Fqx '#!/usr/bin/env bash'; then
+        log_error '下载内容不是有效的 deploy.sh，已拒绝更新。'
+        return 1
+    fi
+    if ! grep -Fqx -- "$QUICK_COMMAND_MARKER" "$candidate"; then
+        log_error '下载内容缺少脚本管理标记，已拒绝更新。'
+        return 1
+    fi
+    candidate_version=$(sed -n "s/^SCRIPT_VERSION='\([^']*\)'.*/\1/p" "$candidate" | head -n 1)
+    if [[ -z $candidate_version ]] || ! bash -n "$candidate"; then
+        log_error '下载脚本的版本号无效或 Bash 语法校验失败，已拒绝更新。'
+        return 1
+    fi
+    printf '%s\n' "$candidate_version"
+}
+
+update_script() {
+    local candidate candidate_version answer
+    candidate=$(mktemp) || return 1
+    script_update_performed='no'
+    log_info "正在检查更新，当前版本: ${SCRIPT_VERSION}"
+
+    if ! download_script_update "$candidate"; then
+        rm -f -- "$candidate"
+        return 1
+    fi
+    if ! candidate_version=$(validate_script_update "$candidate"); then
+        rm -f -- "$candidate"
+        return 1
+    fi
+
+    if [[ $candidate_version == "$SCRIPT_VERSION" ]]; then
+        rm -f -- "$candidate"
+        log_success "当前已是最新版本: ${SCRIPT_VERSION}"
+        return 0
+    fi
+    if version_at_least "$SCRIPT_VERSION" "$candidate_version"; then
+        rm -f -- "$candidate"
+        log_warn "本地版本 ${SCRIPT_VERSION} 高于远端版本 ${candidate_version}，已跳过降级。"
+        return 0
+    fi
+
+    echo "发现新版本: ${SCRIPT_VERSION} -> ${candidate_version}"
+    read -r -p '是否立即更新？[Y/n]: ' answer
+    if [[ $answer =~ ^[Nn]$ ]]; then
+        rm -f -- "$candidate"
+        log_info '已取消更新。'
+        return 0
+    fi
+    if ! install_quick_command "$candidate"; then
+        rm -f -- "$candidate"
+        return 1
+    fi
+    rm -f -- "$candidate"
+    script_update_performed='yes'
+    log_success "脚本已更新: ${SCRIPT_VERSION} -> ${candidate_version}"
+}
+
+uninstall_quick_command() {
+    local answer resolved_target=''
+    echo
+    log_warn '此操作只会删除 /usr/local/bin/nginxproxy。'
+    echo '以下内容全部保留：Nginx、证书、Emby 反代配置、HAProxy/SNI 分流、sb.sh、Sing-box 与 Reality 节点。'
+
+    if [[ ! -e $QUICK_COMMAND_PATH && ! -L $QUICK_COMMAND_PATH ]]; then
+        log_info 'nginxproxy 快捷脚本当前未安装，无需卸载。'
+        return 0
+    fi
+    if [[ -L $QUICK_COMMAND_PATH ]]; then
+        resolved_target=$(readlink -f -- "$QUICK_COMMAND_PATH" 2>/dev/null || true)
+        if [[ -z $resolved_target || ! -f $resolved_target ]] || \
+           ! grep -Fqx -- "$QUICK_COMMAND_MARKER" "$resolved_target"; then
+            log_error "该路径是非本脚本管理的符号链接，拒绝删除: $QUICK_COMMAND_PATH"
+            return 1
+        fi
+    elif [[ ! -f $QUICK_COMMAND_PATH ]] || \
+         ! grep -Fqx -- "$QUICK_COMMAND_MARKER" "$QUICK_COMMAND_PATH"; then
+        log_error "该路径不属于本脚本，拒绝删除: $QUICK_COMMAND_PATH"
+        return 1
+    fi
+
+    read -r -p '确定只卸载 nginxproxy 脚本吗？[y/N]: ' answer
+    if [[ ! $answer =~ ^[Yy]$ ]]; then
+        log_info '已取消卸载。'
+        return 0
+    fi
+    if ! rm -f -- "$QUICK_COMMAND_PATH"; then
+        log_error "无法删除: $QUICK_COMMAND_PATH"
+        return 1
+    fi
+    log_success 'nginxproxy 脚本已卸载；现有反代服务与 Reality 节点均未改动。'
 }
 
 has_systemd() {
@@ -1631,23 +1752,7 @@ validate_nginx_features() {
     fi
 }
 
-main() {
-    parse_arguments "$@"
-    require_root
-
-    if [[ $install_command_only == yes ]]; then
-        if ! install_quick_command; then
-            exit 1
-        fi
-        exit 0
-    fi
-    ensure_quick_command
-
-    if [[ -n $domain_to_remove ]]; then
-        remove_domain_config
-        exit 0
-    fi
-
+run_proxy_deployment() {
     prompt_interactive_mode
     [[ -n $you_domain && -n $r_domain ]] || { log_error '前端和主源站不能为空。'; exit 1; }
     display_summary
@@ -1685,6 +1790,92 @@ main() {
     echo -e "${GREEN}访问地址: ${protocol}://${you_domain}:${you_frontend_port}${you_domain_path}${NC}"
     [[ $frontend_mode == haproxy ]] && echo "公网 :443 -> HAProxy(SNI ${you_domain,,}) -> Nginx ${SNI_ROUTER_BACKEND_HOST}:${SNI_ROUTER_BACKEND_PORT}"
     [[ -x $QUICK_COMMAND_PATH ]] && echo '后续可直接运行: nginxproxy'
+}
+
+pause_for_menu() {
+    [[ -t 0 ]] || return 0
+    echo
+    read -r -n 1 -s -p '按任意键返回主菜单...'
+    echo
+}
+
+main_menu() {
+    local choice
+    while true; do
+        if [[ -t 1 ]] && command -v clear >/dev/null 2>&1; then
+            clear
+        fi
+        echo -e "${BLUE}"
+        echo '  ╔═══════════════════════════════════════╗'
+        echo '  ║          Nginx Emby 反代管理          ║'
+        echo '  ╚═══════════════════════════════════════╝'
+        echo -e "${NC}"
+        echo -e "  版本: ${GREEN}${SCRIPT_VERSION}${NC}"
+        echo
+        echo -e "    ${GREEN}[1]${NC} 添加反代"
+        echo -e "    ${GREEN}[2]${NC} 检查并更新脚本"
+        echo -e "    ${RED}[3]${NC} 卸载反代管理脚本"
+        echo
+        echo -e "    ${YELLOW}[0]${NC} 退出"
+        echo
+        if ! read -r -p '  请输入选项 [0-3]: ' choice; then
+            echo
+            return 0
+        fi
+
+        case $choice in
+            1)
+                run_proxy_deployment
+                pause_for_menu
+                if [[ -x $QUICK_COMMAND_PATH ]]; then
+                    exec "$QUICK_COMMAND_PATH"
+                fi
+                return 0
+                ;;
+            2)
+                if update_script && [[ $script_update_performed == yes ]]; then
+                    log_info '正在重新载入新版脚本...'
+                    exec "$QUICK_COMMAND_PATH"
+                fi
+                pause_for_menu
+                ;;
+            3)
+                if uninstall_quick_command; then
+                    return 0
+                fi
+                pause_for_menu
+                ;;
+            0) return 0 ;;
+            *)
+                log_error '无效输入，请重试。'
+                pause_for_menu
+                ;;
+        esac
+    done
+}
+
+main() {
+    local argument_count=$#
+    parse_arguments "$@"
+    require_root
+
+    if [[ $install_command_only == yes ]]; then
+        if ! install_quick_command; then
+            exit 1
+        fi
+        exit 0
+    fi
+    ensure_quick_command
+
+    if [[ -n $domain_to_remove ]]; then
+        remove_domain_config
+        exit 0
+    fi
+    if ((argument_count == 0)); then
+        main_menu
+        return 0
+    fi
+    run_proxy_deployment
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
