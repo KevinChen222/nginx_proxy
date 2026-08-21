@@ -40,7 +40,7 @@ ACME_NGINX_PRE_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev
 ACME_NGINX_POST_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; elif [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then :; else nginx; fi'
 ACME_NGINX_RELOAD_CMD='if [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s reload; elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; else nginx; fi'
 
-SCRIPT_VERSION='2026.08.21-haproxy6'
+SCRIPT_VERSION='2026.08.21-haproxy7'
 SCRIPT_DOWNLOAD_URL='https://raw.githubusercontent.com/KevinChen222/nginx_proxy/refs/heads/main/deploy.sh'
 QUICK_COMMAND_PATH='/usr/local/bin/nginxproxy'
 QUICK_COMMAND_MARKER='# NGINXPROXY_MANAGED_COMMAND=1'
@@ -49,6 +49,8 @@ SNI_ROUTER_API_VERSION='1'
 SNI_ROUTER_OWNER='nginx-proxy'
 SNI_ROUTER_BACKEND_HOST='127.0.0.1'
 SNI_ROUTER_BACKEND_PORT='8444'
+TRANSFER_SCHEMA='nginxproxy-links'
+TRANSFER_VERSION=1
 
 # Temporary rollback snapshots for files changed during this invocation.
 declare -a config_tx_targets=()
@@ -937,6 +939,318 @@ show_managed_links() {
     done
 }
 
+ensure_transfer_tools() {
+    if command -v jq >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1; then
+        return 0
+    fi
+    log_info '导入/导出功能需要 jq 与 base64，正在补齐依赖...'
+    install_dependencies
+    if ! command -v jq >/dev/null 2>&1 || ! command -v base64 >/dev/null 2>&1; then
+        log_error '未能安装 jq 或 base64，无法使用链路传输功能。'
+        return 1
+    fi
+}
+
+build_link_export_payload() {
+    local conf_dir=${1:-/etc/nginx/conf.d}
+    local payload item streams_json i conf frontend main stream valid
+    local no_redirect tls_verify no_redirect_json tls_verify_json
+    discover_managed_links "$conf_dir"
+    payload=$(jq -cn --arg schema "$TRANSFER_SCHEMA" --argjson version "$TRANSFER_VERSION" \
+        '{schema:$schema,version:$version,links:[]}') || return 1
+
+    for i in "${!managed_link_configs[@]}"; do
+        conf=${managed_link_configs[$i]}
+        frontend=${managed_link_frontends[$i]}
+        main=${managed_link_mains[$i]}
+        if ! parse_url "$frontend" >/dev/null 2>&1 || ! parse_url "$main" >/dev/null 2>&1; then
+            log_warn "链路元数据不完整，已跳过导出: $frontend -> $main"
+            continue
+        fi
+
+        valid=yes
+        while IFS= read -r stream; do
+            [[ -n $stream ]] || continue
+            if ! parse_url "$stream" >/dev/null 2>&1; then
+                valid=no
+                break
+            fi
+        done <<<"${managed_link_streams[$i]}"
+        if [[ $valid != yes ]]; then
+            log_warn "推流 URL 无效，已跳过整条链路: $frontend"
+            continue
+        fi
+
+        streams_json=$(printf '%s' "${managed_link_streams[$i]}" | \
+            jq -Rsc 'split("\n") | map(select(length > 0))') || return 1
+        no_redirect=$(sed -n 's/^# nginxproxy-no-proxy-redirect: //p' "$conf" | head -n 1)
+        if [[ $no_redirect != yes && $no_redirect != no ]]; then
+            if grep -Eq 'proxy_redirect.*\$emby_public_host' "$conf"; then no_redirect=no; else no_redirect=yes; fi
+        fi
+        tls_verify=$(sed -n 's/^# nginxproxy-upstream-tls-verify: //p' "$conf" | head -n 1)
+        if [[ $tls_verify != yes && $tls_verify != no ]]; then
+            if grep -Eq '^[[:space:]]*proxy_ssl_verify on;' "$conf"; then tls_verify=yes; else tls_verify=no; fi
+        fi
+        [[ $no_redirect == yes ]] && no_redirect_json=true || no_redirect_json=false
+        [[ $tls_verify == yes ]] && tls_verify_json=true || tls_verify_json=false
+
+        item=$(jq -cn \
+            --arg source_frontend "$frontend" \
+            --arg main "$main" \
+            --argjson streams "$streams_json" \
+            --argjson no_proxy_redirect "$no_redirect_json" \
+            --argjson upstream_tls_verify "$tls_verify_json" \
+            '{source_frontend:$source_frontend,main:$main,streams:$streams,no_proxy_redirect:$no_proxy_redirect,upstream_tls_verify:$upstream_tls_verify}') || return 1
+        payload=$(jq -c --argjson item "$item" '.links += [$item]' <<<"$payload") || return 1
+    done
+    printf '%s\n' "$payload"
+}
+
+export_managed_links_base64() {
+    ensure_transfer_tools || return 1
+    local payload count encoded
+    payload=$(build_link_export_payload) || return 1
+    count=$(jq -r '.links | length' <<<"$payload" | tr -d '\r')
+    if ((count == 0)); then
+        log_error '没有可导出的有效反代链路。'
+        return 1
+    fi
+    encoded=$(printf '%s' "$payload" | base64 | tr -d '\r\n')
+    echo
+    echo -e "${BLUE}----- NGINXPROXY BASE64 导出开始 -----${NC}"
+    printf '%s\n' "$encoded"
+    echo -e "${BLUE}----- NGINXPROXY BASE64 导出结束 -----${NC}"
+    log_success "已导出 ${count} 条链路。Base64 仅用于传输，不是加密；内容不含证书私钥和令牌。"
+}
+
+decode_transfer_payload() {
+    local encoded=$1 normalized
+    encoded=$(printf '%s' "$encoded" | tr -d '[:space:]')
+    if [[ -z $encoded || ${#encoded} -gt 1048576 ]]; then
+        log_error 'Base64 内容为空或超过 1 MiB 限制。'
+        return 1
+    fi
+    if ! normalized=$(printf '%s' "$encoded" | base64 -d 2>/dev/null | jq -ce \
+        --arg schema "$TRANSFER_SCHEMA" --argjson version "$TRANSFER_VERSION" '
+        select(
+            type == "object" and
+            .schema == $schema and
+            .version == $version and
+            (.links | type == "array") and
+            (.links | length >= 1 and length <= 50) and
+            all(.links[];
+                (.source_frontend | type == "string") and
+                (.main | type == "string") and
+                (.streams | type == "array") and
+                all(.streams[]; type == "string") and
+                (.no_proxy_redirect | type == "boolean") and
+                (.upstream_tls_verify | type == "boolean")
+            )
+        )
+        '); then
+        log_error 'Base64 解码失败，或内容不是受支持的 nginxproxy 导出格式。'
+        return 1
+    fi
+    normalized=${normalized%$'\r'}
+    printf '%s\n' "$normalized"
+}
+
+validate_transfer_payload_urls() {
+    local payload=$1 count i source_frontend main stream
+    count=$(jq -r '.links | length' <<<"$payload" | tr -d '\r') || return 1
+    for ((i=0; i<count; i++)); do
+        source_frontend=$(jq -r --argjson i "$i" '.links[$i].source_frontend' <<<"$payload" | tr -d '\r')
+        main=$(jq -r --argjson i "$i" '.links[$i].main' <<<"$payload" | tr -d '\r')
+        if ! parse_url "$source_frontend" >/dev/null 2>&1 || ! parse_url "$main" >/dev/null 2>&1; then
+            log_error "导入数据第 $((i + 1)) 条链路包含无效 URL。"
+            return 1
+        fi
+        while IFS= read -r stream; do
+            if ! parse_url "$stream" >/dev/null 2>&1; then
+                log_error "导入数据第 $((i + 1)) 条链路包含无效推流 URL。"
+                return 1
+            fi
+        done < <(jq -r --argjson i "$i" '.links[$i].streams[]' <<<"$payload" | tr -d '\r')
+    done
+}
+
+normalize_import_frontend() {
+    local raw=$1 parsed proto domain port path default_port
+    raw=${raw//$'\r'/}
+    raw="${raw#"${raw%%[![:space:]]*}"}"
+    raw="${raw%"${raw##*[![:space:]]}"}"
+    [[ -n $raw ]] || return 1
+    [[ $raw == http://* || $raw == https://* ]] || raw="https://${raw}"
+    parsed=$(parse_url "$raw") || return 1
+    IFS='|' read -r proto domain port path <<<"$parsed"
+    default_port=$(get_default_port "$proto")
+    port=${port:-$default_port}
+    printf '%s://%s:%s%s\n' "$proto" "${domain,,}" "$port" "$path"
+}
+
+import_links_from_base64() {
+    ensure_transfer_tools || return 1
+    local encoded payload count i source_frontend main streams_json stream import_choice
+    local frontend parsed proto domain port path share_answer mode clean_domain conf_path overwrite_answer
+    local runner progress_label existing duplicate
+    local -a import_sources=() import_frontends=() import_mains=() import_streams=()
+    local -a import_modes=() import_no_redirect=() import_tls_verify=()
+    local -a success_links=() failed_links=() skipped_links=() seen_frontends=()
+
+    echo
+    read -r -p '请粘贴 NGINXPROXY Base64 字符串: ' encoded
+    if ! payload=$(decode_transfer_payload "$encoded"); then
+        return 0
+    fi
+    if ! validate_transfer_payload_urls "$payload"; then
+        return 0
+    fi
+    count=$(jq -r '.links | length' <<<"$payload" | tr -d '\r')
+    echo
+    log_info "已识别 ${count} 条反代链路。先收集目标域名与分流选择，再依次部署。"
+
+    for ((i=0; i<count; i++)); do
+        source_frontend=$(jq -r --argjson i "$i" '.links[$i].source_frontend' <<<"$payload" | tr -d '\r')
+        main=$(jq -r --argjson i "$i" '.links[$i].main' <<<"$payload" | tr -d '\r')
+        streams_json=$(jq -c --argjson i "$i" '.links[$i].streams' <<<"$payload")
+        echo
+        echo -e "${BLUE}[$((i + 1))/$count] 来源链路: ${source_frontend} -> ${main}${NC}"
+        while IFS= read -r stream; do
+            echo "    推流: $stream"
+        done < <(jq -r '.[]' <<<"$streams_json" | tr -d '\r')
+        read -r -p '是否导入此链路？[Y/n]: ' import_choice
+        if [[ $import_choice =~ ^[Nn]$ ]]; then
+            skipped_links+=("$source_frontend")
+            continue
+        fi
+
+        while true; do
+            read -r -p '请输入此链路在本机供客户端访问的域名或完整 URL: ' frontend
+            if ! frontend=$(normalize_import_frontend "$frontend"); then
+                log_warn '访问地址无效；可输入 emby.example.com 或 https://emby.example.com:443。'
+                continue
+            fi
+            parsed=$(parse_url "$frontend") || continue
+            IFS='|' read -r proto domain port path <<<"$parsed"
+            port=${port:-$(get_default_port "$proto")}
+
+            duplicate=no
+            for existing in "${seen_frontends[@]}"; do
+                if [[ ${existing,,} == "${frontend,,}" ]]; then duplicate=yes; break; fi
+            done
+            if [[ $duplicate == yes ]]; then
+                log_warn '该目标访问地址已被本次导入中的另一条链路使用，请更换。'
+                continue
+            fi
+
+            clean_domain=${domain//[\[\]]/}
+            conf_path="/etc/nginx/conf.d/${clean_domain}.${port}.conf"
+            if [[ -e $conf_path ]]; then
+                if ! grep -Fqx '# Generated by deploy-stream-domains.sh' "$conf_path"; then
+                    log_error "目标配置已存在且不属于本脚本，拒绝覆盖: $conf_path"
+                    continue
+                fi
+                log_warn "目标链路已存在，导入成功后将更新它: $conf_path"
+                read -r -p '确认更新现有链路？[y/N]: ' overwrite_answer
+                [[ $overwrite_answer =~ ^[Yy]$ ]] || continue
+            fi
+
+            while true; do
+                read -r -p '是否使用 HAProxy SNI 分流？[Y/n]: ' share_answer
+                if [[ $share_answer =~ ^[Nn]$ ]]; then
+                    mode=direct
+                    break
+                fi
+                if [[ $proto != https || $port != 443 ]] || is_ip_address "$domain"; then
+                    log_warn 'HAProxy SNI 分流要求客户端地址为 HTTPS 域名且端口为 443；请选择 n 或重新输入访问地址。'
+                    continue
+                fi
+                if [[ ! -x $SNI_ROUTER_BIN ]]; then
+                    log_warn "未找到 ${SNI_ROUTER_BIN}；请先安装同仓库 sb.sh，或选择 n 使用 Nginx 直连。"
+                    continue
+                fi
+                mode=haproxy
+                break
+            done
+            break
+        done
+
+        seen_frontends+=("$frontend")
+        import_sources+=("$source_frontend")
+        import_frontends+=("$frontend")
+        import_mains+=("$main")
+        import_streams+=("$streams_json")
+        import_modes+=("$mode")
+        import_no_redirect+=("$(jq -r --argjson i "$i" 'if .links[$i].no_proxy_redirect then "yes" else "no" end' <<<"$payload" | tr -d '\r')")
+        import_tls_verify+=("$(jq -r --argjson i "$i" 'if .links[$i].upstream_tls_verify then "yes" else "no" end' <<<"$payload" | tr -d '\r')")
+    done
+
+    if ((${#import_frontends[@]} == 0)); then
+        log_info '没有选择需要导入的链路。'
+        return 0
+    fi
+    if ! runner=$(current_script_path) || [[ ! -f $runner ]]; then
+        log_error '无法定位当前脚本文件，不能启动独立导入任务。'
+        return 1
+    fi
+
+    echo
+    log_info "开始依次部署 ${#import_frontends[@]} 条链路；证书申请可能需要较长时间。"
+    for i in "${!import_frontends[@]}"; do
+        progress_label="${import_frontends[$i]} -> ${import_mains[$i]}"
+        echo
+        echo -e "${BLUE}========== 导入 $((i + 1))/${#import_frontends[@]}: ${progress_label} ==========${NC}"
+        local -a deploy_command=(bash "$runner" -y "${import_frontends[$i]}" -r "${import_mains[$i]}" --frontend-mode "${import_modes[$i]}")
+        while IFS= read -r stream; do
+            deploy_command+=(-s "$stream")
+        done < <(jq -r '.[]' <<<"${import_streams[$i]}" | tr -d '\r')
+        [[ ${import_no_redirect[$i]} == yes ]] && deploy_command+=(--no-proxy-redirect)
+        [[ ${import_tls_verify[$i]} == no ]] && deploy_command+=(--no-upstream-tls-verify)
+
+        if "${deploy_command[@]}"; then
+            success_links+=("$progress_label")
+        else
+            failed_links+=("$progress_label")
+        fi
+    done
+
+    echo
+    echo -e "${BLUE}--- 批量导入结果 ---${NC}"
+    if ((${#success_links[@]})); then
+        echo '成功:'
+        printf '  - %s\n' "${success_links[@]}"
+    fi
+    if ((${#failed_links[@]})); then
+        echo '失败:'
+        printf '  - %s\n' "${failed_links[@]}"
+    fi
+    if ((${#skipped_links[@]})); then
+        echo '跳过:'
+        printf '  - %s\n' "${skipped_links[@]}"
+    fi
+    if ((${#failed_links[@]} == 0)); then
+        log_success "选择的 ${#success_links[@]} 条反代链路已全部导入成功。"
+    else
+        log_warn "导入完成：成功 ${#success_links[@]} 条，失败 ${#failed_links[@]} 条。失败链路已在上方列出。"
+    fi
+}
+
+link_transfer_menu() {
+    local action
+    show_managed_links
+    echo
+    echo '  [1] 导出当前反代链路为 Base64'
+    echo '  [2] 从其他机器的 Base64 导入链路'
+    echo '  [0] 返回主菜单'
+    read -r -p '请选择操作 [0-2]: ' action
+    case $action in
+        1) export_managed_links_base64 || true ;;
+        2) import_links_from_base64 || true ;;
+        0) return 0 ;;
+        *) log_error '无效输入。' ;;
+    esac
+}
+
 reset_proxy_inputs() {
     you_domain_full=''
     r_domain_full=''
@@ -1255,7 +1569,7 @@ install_dependencies() {
     local -a required_packages=()
     local dependencies_ready=yes
     local required_command
-    for required_command in nginx curl socat openssl envsubst tar sha256sum timeout; do
+    for required_command in nginx curl socat openssl envsubst tar sha256sum timeout jq base64; do
         command -v "$required_command" >/dev/null 2>&1 || dependencies_ready=no
     done
     command -v crontab >/dev/null 2>&1 || dependencies_ready=no
@@ -1281,24 +1595,24 @@ install_dependencies() {
 
     if command -v apt-get >/dev/null 2>&1; then
         pm=apt
-        required_packages=(nginx curl ca-certificates socat cron openssl gettext-base tar coreutils)
+        required_packages=(nginx curl ca-certificates socat cron openssl gettext-base tar coreutils jq)
         $SUDO apt-get update
         $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y "${required_packages[@]}"
     elif command -v dnf >/dev/null 2>&1; then
         pm=dnf
-        required_packages=(nginx curl ca-certificates socat cronie openssl gettext)
+        required_packages=(nginx curl ca-certificates socat cronie openssl gettext coreutils jq)
         $SUDO dnf install -y "${required_packages[@]}"
     elif command -v yum >/dev/null 2>&1; then
         pm=yum
-        required_packages=(nginx curl ca-certificates socat cronie openssl gettext)
+        required_packages=(nginx curl ca-certificates socat cronie openssl gettext coreutils jq)
         $SUDO yum install -y "${required_packages[@]}"
     elif command -v pacman >/dev/null 2>&1; then
         pm=pacman
-        required_packages=(nginx curl ca-certificates socat cronie openssl gettext)
+        required_packages=(nginx curl ca-certificates socat cronie openssl gettext coreutils jq)
         $SUDO pacman -Sy --noconfirm "${required_packages[@]}"
     elif command -v apk >/dev/null 2>&1; then
         pm=apk
-        required_packages=(nginx curl ca-certificates socat dcron openssl gettext)
+        required_packages=(nginx curl ca-certificates socat dcron openssl gettext coreutils jq)
         $SUDO apk add --no-cache "${required_packages[@]}"
     else
         log_error "不支持的系统，无法识别包管理器。ID=${os_id}, ID_LIKE=${id_like}"
@@ -2099,7 +2413,7 @@ main_menu() {
                 return 0
                 ;;
             2)
-                show_managed_links
+                link_transfer_menu
                 pause_for_menu
                 ;;
             3)
