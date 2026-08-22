@@ -40,7 +40,7 @@ ACME_NGINX_PRE_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev
 ACME_NGINX_POST_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; elif [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then :; else nginx; fi'
 ACME_NGINX_RELOAD_CMD='if [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s reload; elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; else nginx; fi'
 
-SCRIPT_VERSION='2026.08.21-haproxy7'
+SCRIPT_VERSION='2026.08.22-local1'
 SCRIPT_DOWNLOAD_URL='https://raw.githubusercontent.com/KevinChen222/nginx_proxy/refs/heads/main/deploy.sh'
 QUICK_COMMAND_PATH='/usr/local/bin/nginxproxy'
 QUICK_COMMAND_MARKER='# NGINXPROXY_MANAGED_COMMAND=1'
@@ -50,7 +50,7 @@ SNI_ROUTER_OWNER='nginx-proxy'
 SNI_ROUTER_BACKEND_HOST='127.0.0.1'
 SNI_ROUTER_BACKEND_PORT='8444'
 TRANSFER_SCHEMA='nginxproxy-links'
-TRANSFER_VERSION=1
+TRANSFER_VERSION=2
 
 # Temporary rollback snapshots for files changed during this invocation.
 declare -a config_tx_targets=()
@@ -70,6 +70,7 @@ r_frontend_port=''
 r_http_frontend=''
 
 # Optional settings.
+proxy_mode='emby'
 cert_domain=''
 manual_resolver=''
 parse_cert_domain='no'
@@ -109,6 +110,7 @@ declare -a managed_link_configs=()
 declare -a managed_link_frontends=()
 declare -a managed_link_mains=()
 declare -a managed_link_streams=()
+declare -a managed_link_modes=()
 
 log_info()    { echo -e "${BLUE}[INFO]${NC} $*" >&2; }
 log_success() { echo -e "${GREEN}[SUCCESS]${NC} $*" >&2; }
@@ -248,13 +250,13 @@ show_help() {
     cat <<EOF
 用法: $(basename "$0") [选项]
 
-部署一个支持“主 Emby 域名 + 多个独立推流域名”的 Nginx 反向代理。
+部署 Emby 反向代理，或将 HTTPS 域名转发到 VPS 本机的 HTTP 服务。
 不带参数运行时进入管理菜单，可添加、查看、修改或删除反代链路。
 
 部署选项:
   -y, --you-domain <URL>       用户访问的反代 URL
                                例如: https://emby.example.com:443
-  -r, --r-domain <URL>         Emby 登录/API 主源站 URL
+  -r, --r-domain <URL>         Emby 主源站或本机服务 URL
                                例如: https://v1.uhdnow.com:443
   -s, --stream-domain <URL>    推流/CDN 源站 URL，可重复使用多次
                                例如: -s https://v1-vod1.example.com:443 \\
@@ -268,6 +270,7 @@ show_help() {
       --gh-proxy <URL>         显式指定 GitHub 加速前缀（下载仍会校验哈希）
       --no-proxy-redirect      不改写未显式配置的普通重定向
       --no-upstream-tls-verify 不校验 HTTPS 源站证书（仅用于自签名源站）
+      --local-service          本机服务模式；-r 必须是 127.0.0.0/8 或 [::1]
       --frontend-mode <模式>   direct（Nginx 直监听）或 haproxy（与 Reality 共享 443）
       --sni-router             等同于 --frontend-mode haproxy
       --version                显示脚本版本
@@ -279,6 +282,7 @@ show_help() {
   -h, --help                   显示帮助
 
 交互模式中，主源站输入完成后会连续询问推流源站；直接回车结束。
+Emby 前端根路径 / 返回无跳转欢迎页，Web UI 仍可通过 /web/ 访问。
 EOF
 }
 
@@ -383,7 +387,7 @@ uninstall_quick_command() {
     local answer resolved_target=''
     echo
     log_warn '此操作只会删除 /usr/local/bin/nginxproxy。'
-    echo '以下内容全部保留：Nginx、证书、Emby 反代配置、HAProxy/SNI 分流、sb.sh、Sing-box 与 Reality 节点。'
+    echo '以下内容全部保留：Nginx、证书、现有反代配置、HAProxy/SNI 分流、sb.sh、Sing-box 与 Reality 节点。'
 
     if [[ ! -e $QUICK_COMMAND_PATH && ! -L $QUICK_COMMAND_PATH ]]; then
         log_info 'nginxproxy 快捷脚本当前未安装，无需卸载。'
@@ -444,7 +448,7 @@ prepare_sni_router() {
 register_sni_route() {
     [[ $frontend_mode == haproxy ]] || return 0
     if [[ $sni_route_preexisting == yes ]]; then
-        log_info "HAProxy 已登记该 Emby SNI，保留现有路由。"
+        log_info "HAProxy 已登记该 HTTPS SNI，保留现有路由。"
         return 0
     fi
     sni_router_call register-https "$SNI_ROUTER_OWNER" "${you_domain,,}" "$SNI_ROUTER_BACKEND_PORT" || return 1
@@ -789,6 +793,28 @@ is_ip_address() {
     fi
 }
 
+is_loopback_address() {
+    local address=${1#[}
+    address=${address%]}
+    if [[ $address == ::1 ]]; then
+        return 0
+    fi
+    is_valid_ipv4 "$address" && [[ ${address%%.*} == 127 ]]
+}
+
+validate_local_service_upstream() {
+    [[ $proxy_mode == local ]] || return 0
+    if ! is_loopback_address "$r_domain"; then
+        log_error '本机服务模式只允许 127.0.0.0/8 或 [::1] 上游。'
+        log_error '若服务位于 Docker 中，请先把其端口安全地发布到 VPS 回环地址。'
+        return 1
+    fi
+    if ((${#stream_origins[@]})); then
+        log_error '本机服务模式不能配置 Emby 推流/CDN 源站。'
+        return 1
+    fi
+}
+
 get_default_port() {
     [[ $1 == http ]] && printf '80\n' || printf '443\n'
 }
@@ -865,12 +891,13 @@ add_stream_url() {
 
 discover_managed_links() {
     local conf_dir=${1:-/etc/nginx/conf.d}
-    local conf link_version frontend main streams host port proto path
+    local conf link_version frontend main streams mode host port proto path
 
     managed_link_configs=()
     managed_link_frontends=()
     managed_link_mains=()
     managed_link_streams=()
+    managed_link_modes=()
 
     [[ -d $conf_dir ]] || return 0
     for conf in "$conf_dir"/*.conf; do
@@ -880,6 +907,8 @@ discover_managed_links() {
         link_version=$(sed -n 's/^# nginxproxy-link-version: //p' "$conf" | head -n 1)
         frontend=$(sed -n 's/^# nginxproxy-frontend: //p' "$conf" | head -n 1)
         main=$(sed -n 's/^# nginxproxy-main: //p' "$conf" | head -n 1)
+        mode=$(sed -n 's/^# nginxproxy-mode: //p' "$conf" | head -n 1)
+        [[ $mode == local ]] || mode=emby
 
         # Compatibility with configurations generated before link metadata was
         # introduced. The upstream base path cannot always be recovered from
@@ -899,7 +928,7 @@ discover_managed_links() {
             fi
         fi
         if [[ -z $main ]]; then
-            main=$(awk -F "'" '/^[[:space:]]*set \$emby_main_upstream / {print $2; exit}' "$conf")
+            main=$(awk -F "'" '/^[[:space:]]*set \$(emby_main_upstream|local_service_upstream) / {print $2; exit}' "$conf")
         fi
         if [[ $link_version == 1 ]]; then
             streams=$(sed -n 's/^# nginxproxy-stream: //p' "$conf")
@@ -913,6 +942,7 @@ discover_managed_links() {
         managed_link_frontends+=("$frontend")
         managed_link_mains+=("$main")
         managed_link_streams+=("$streams")
+        managed_link_modes+=("$mode")
     done
 }
 
@@ -920,15 +950,19 @@ show_managed_links() {
     local conf_dir=${1:-/etc/nginx/conf.d}
     local i stream stream_index
     discover_managed_links "$conf_dir"
-    echo -e "\n${BLUE}--- 现有 Emby 反代链路 ---${NC}"
+    echo -e "\n${BLUE}--- 现有反代链路 ---${NC}"
     if ((${#managed_link_configs[@]} == 0)); then
         log_info '未找到由本脚本生成的反代链路。'
         return 0
     fi
 
     for i in "${!managed_link_configs[@]}"; do
-        printf '  [%d] %s -> %s\n' "$((i + 1))" \
+        printf '  [%d] [%s] %s -> %s\n' "$((i + 1))" \
+            "$([[ ${managed_link_modes[$i]} == local ]] && echo '本机' || echo 'Emby')" \
             "${managed_link_frontends[$i]}" "${managed_link_mains[$i]}"
+        if [[ ${managed_link_modes[$i]} == local ]]; then
+            continue
+        fi
         stream_index=0
         while IFS= read -r stream; do
             [[ -n $stream ]] || continue
@@ -953,7 +987,7 @@ ensure_transfer_tools() {
 
 build_link_export_payload() {
     local conf_dir=${1:-/etc/nginx/conf.d}
-    local payload item streams_json i conf frontend main stream valid
+    local payload item streams_json i conf frontend main mode stream valid
     local no_redirect tls_verify no_redirect_json tls_verify_json
     discover_managed_links "$conf_dir"
     payload=$(jq -cn --arg schema "$TRANSFER_SCHEMA" --argjson version "$TRANSFER_VERSION" \
@@ -963,6 +997,7 @@ build_link_export_payload() {
         conf=${managed_link_configs[$i]}
         frontend=${managed_link_frontends[$i]}
         main=${managed_link_mains[$i]}
+        mode=${managed_link_modes[$i]}
         if ! parse_url "$frontend" >/dev/null 2>&1 || ! parse_url "$main" >/dev/null 2>&1; then
             log_warn "链路元数据不完整，已跳过导出: $frontend -> $main"
             continue
@@ -997,10 +1032,11 @@ build_link_export_payload() {
         item=$(jq -cn \
             --arg source_frontend "$frontend" \
             --arg main "$main" \
+            --arg mode "$mode" \
             --argjson streams "$streams_json" \
             --argjson no_proxy_redirect "$no_redirect_json" \
             --argjson upstream_tls_verify "$tls_verify_json" \
-            '{source_frontend:$source_frontend,main:$main,streams:$streams,no_proxy_redirect:$no_proxy_redirect,upstream_tls_verify:$upstream_tls_verify}') || return 1
+            '{source_frontend:$source_frontend,main:$main,mode:$mode,streams:$streams,no_proxy_redirect:$no_proxy_redirect,upstream_tls_verify:$upstream_tls_verify}') || return 1
         payload=$(jq -c --argjson item "$item" '.links += [$item]' <<<"$payload") || return 1
     done
     printf '%s\n' "$payload"
@@ -1035,12 +1071,13 @@ decode_transfer_payload() {
         select(
             type == "object" and
             .schema == $schema and
-            .version == $version and
+            (.version == 1 or .version == $version) and
             (.links | type == "array") and
             (.links | length >= 1 and length <= 50) and
             all(.links[];
                 (.source_frontend | type == "string") and
                 (.main | type == "string") and
+                ((.mode // "emby") == "emby" or (.mode // "emby") == "local") and
                 (.streams | type == "array") and
                 all(.streams[]; type == "string") and
                 (.no_proxy_redirect | type == "boolean") and
@@ -1056,14 +1093,27 @@ decode_transfer_payload() {
 }
 
 validate_transfer_payload_urls() {
-    local payload=$1 count i source_frontend main stream
+    local payload=$1 count i source_frontend main mode parsed_main main_proto main_host main_port main_path stream
     count=$(jq -r '.links | length' <<<"$payload" | tr -d '\r') || return 1
     for ((i=0; i<count; i++)); do
         source_frontend=$(jq -r --argjson i "$i" '.links[$i].source_frontend' <<<"$payload" | tr -d '\r')
         main=$(jq -r --argjson i "$i" '.links[$i].main' <<<"$payload" | tr -d '\r')
+        mode=$(jq -r --argjson i "$i" '.links[$i].mode // "emby"' <<<"$payload" | tr -d '\r')
         if ! parse_url "$source_frontend" >/dev/null 2>&1 || ! parse_url "$main" >/dev/null 2>&1; then
             log_error "导入数据第 $((i + 1)) 条链路包含无效 URL。"
             return 1
+        fi
+        if [[ $mode == local ]]; then
+            parsed_main=$(parse_url "$main") || return 1
+            IFS='|' read -r main_proto main_host main_port main_path <<<"$parsed_main"
+            if ! is_loopback_address "$main_host"; then
+                log_error "导入数据第 $((i + 1)) 条本机服务链路不是回环地址。"
+                return 1
+            fi
+            if [[ $(jq -r --argjson i "$i" '.links[$i].streams | length' <<<"$payload") != 0 ]]; then
+                log_error "导入数据第 $((i + 1)) 条本机服务链路包含不允许的推流源站。"
+                return 1
+            fi
         fi
         while IFS= read -r stream; do
             if ! parse_url "$stream" >/dev/null 2>&1; then
@@ -1090,11 +1140,11 @@ normalize_import_frontend() {
 
 import_links_from_base64() {
     ensure_transfer_tools || return 1
-    local encoded payload count i source_frontend main streams_json stream import_choice
+    local encoded payload count i source_frontend main proxy_kind streams_json stream import_choice
     local frontend parsed proto domain port path share_answer mode clean_domain conf_path overwrite_answer
     local runner progress_label existing duplicate
     local -a import_sources=() import_frontends=() import_mains=() import_streams=()
-    local -a import_modes=() import_no_redirect=() import_tls_verify=()
+    local -a import_modes=() import_proxy_kinds=() import_no_redirect=() import_tls_verify=()
     local -a success_links=() failed_links=() skipped_links=() seen_frontends=()
 
     echo
@@ -1112,9 +1162,10 @@ import_links_from_base64() {
     for ((i=0; i<count; i++)); do
         source_frontend=$(jq -r --argjson i "$i" '.links[$i].source_frontend' <<<"$payload" | tr -d '\r')
         main=$(jq -r --argjson i "$i" '.links[$i].main' <<<"$payload" | tr -d '\r')
+        proxy_kind=$(jq -r --argjson i "$i" '.links[$i].mode // "emby"' <<<"$payload" | tr -d '\r')
         streams_json=$(jq -c --argjson i "$i" '.links[$i].streams' <<<"$payload")
         echo
-        echo -e "${BLUE}[$((i + 1))/$count] 来源链路: ${source_frontend} -> ${main}${NC}"
+        echo -e "${BLUE}[$((i + 1))/$count] 来源链路 [$([[ $proxy_kind == local ]] && echo '本机' || echo 'Emby')]: ${source_frontend} -> ${main}${NC}"
         while IFS= read -r stream; do
             echo "    推流: $stream"
         done < <(jq -r '.[]' <<<"$streams_json" | tr -d '\r')
@@ -1133,6 +1184,10 @@ import_links_from_base64() {
             parsed=$(parse_url "$frontend") || continue
             IFS='|' read -r proto domain port path <<<"$parsed"
             port=${port:-$(get_default_port "$proto")}
+            if [[ $proxy_kind == local && $proto != https ]]; then
+                log_warn '本机服务模式要求 HTTPS 前端；请重新输入 https:// 地址。'
+                continue
+            fi
 
             duplicate=no
             for existing in "${seen_frontends[@]}"; do
@@ -1181,6 +1236,7 @@ import_links_from_base64() {
         import_mains+=("$main")
         import_streams+=("$streams_json")
         import_modes+=("$mode")
+        import_proxy_kinds+=("$proxy_kind")
         import_no_redirect+=("$(jq -r --argjson i "$i" 'if .links[$i].no_proxy_redirect then "yes" else "no" end' <<<"$payload" | tr -d '\r')")
         import_tls_verify+=("$(jq -r --argjson i "$i" 'if .links[$i].upstream_tls_verify then "yes" else "no" end' <<<"$payload" | tr -d '\r')")
     done
@@ -1201,6 +1257,7 @@ import_links_from_base64() {
         echo
         echo -e "${BLUE}========== 导入 $((i + 1))/${#import_frontends[@]}: ${progress_label} ==========${NC}"
         local -a deploy_command=(bash "$runner" -y "${import_frontends[$i]}" -r "${import_mains[$i]}" --frontend-mode "${import_modes[$i]}")
+        [[ ${import_proxy_kinds[$i]} == local ]] && deploy_command+=(--local-service)
         while IFS= read -r stream; do
             deploy_command+=(-s "$stream")
         done < <(jq -r '.[]' <<<"${import_streams[$i]}" | tr -d '\r')
@@ -1252,6 +1309,7 @@ link_transfer_menu() {
 }
 
 reset_proxy_inputs() {
+    proxy_mode='emby'
     you_domain_full=''
     r_domain_full=''
     you_domain=''
@@ -1297,6 +1355,8 @@ load_managed_link_for_edit() {
 
     reset_proxy_inputs
     process_url_input "$frontend" you || return 1
+    proxy_mode=$(sed -n 's/^# nginxproxy-mode: //p' "$conf" | head -n 1)
+    [[ $proxy_mode == local ]] || proxy_mode=emby
 
     if grep -Eq '^# sb-sni-router: ' "$conf"; then
         frontend_mode=haproxy
@@ -1331,6 +1391,17 @@ prompt_replacement_upstreams() {
     local current_main=$1 input_r input_stream
     echo -e "\n${BLUE}--- 修改反代链路 ---${NC}"
     echo "前端地址保持不变: $you_domain_full"
+    if [[ $proxy_mode == local ]]; then
+        echo "当前本机服务: $current_main"
+        while true; do
+            read -r -p '请输入新的本机服务 URL（例如 http://127.0.0.1:3000）: ' input_r
+            if process_url_input "$input_r" r && validate_local_service_upstream; then
+                r_domain_full=$input_r
+                return 0
+            fi
+            log_warn 'URL 无效；必须使用 http(s)://127.x.x.x:端口 或 http(s)://[::1]:端口。'
+        done
+    fi
     echo "当前 Emby 主站: $current_main"
     echo '请重新输入主站和全部推流源站；推流直接回车表示不再单独配置。'
 
@@ -1396,7 +1467,7 @@ manage_existing_link() {
 
 parse_arguments() {
     local temp
-    temp=$(getopt -o y:r:s:m:R:dD:hY --long you-domain:,r-domain:,stream-domain:,cert-domain:,resolver:,parse-cert-domain,dns:,cf-token:,cf-account-id:,gh-proxy:,remove:,yes,no-proxy-redirect,no-upstream-tls-verify,frontend-mode:,sni-router,install-command,version,help -n "$(basename "$0")" -- "$@") || exit 1
+    temp=$(getopt -o y:r:s:m:R:dD:hY --long you-domain:,r-domain:,stream-domain:,cert-domain:,resolver:,parse-cert-domain,dns:,cf-token:,cf-account-id:,gh-proxy:,remove:,yes,no-proxy-redirect,no-upstream-tls-verify,local-service,frontend-mode:,sni-router,install-command,version,help -n "$(basename "$0")" -- "$@") || exit 1
     eval set -- "$temp"
 
     while true; do
@@ -1415,6 +1486,7 @@ parse_arguments() {
             -Y|--yes) force_yes=yes; shift ;;
             --no-proxy-redirect) no_proxy_redirect=yes; shift ;;
             --no-upstream-tls-verify) upstream_tls_verify=no; shift ;;
+            --local-service) proxy_mode=local; shift ;;
             --frontend-mode) frontend_mode=${2,,}; frontend_mode_explicit=yes; shift 2 ;;
             --sni-router) frontend_mode=haproxy; frontend_mode_explicit=yes; shift ;;
             --install-command) install_command_only=yes; shift ;;
@@ -1455,10 +1527,19 @@ prompt_interactive_mode() {
         fi
 
         entered_interactive_mode=yes
-        echo -e "\n${BLUE}--- 交互模式: 配置 Emby 反向代理 ---${NC}"
+        if [[ $proxy_mode == local ]]; then
+            echo -e "\n${BLUE}--- 交互模式: 配置本机服务反向代理 ---${NC}"
+            echo '建议每个服务使用独立子域名和根路径 /；子路径是否可用仍取决于应用自身。'
+        else
+            echo -e "\n${BLUE}--- 交互模式: 配置 Emby 反向代理 ---${NC}"
+        fi
         local input_you input_r
         read -r -p "请输入要访问的地址（例如 https://emby.example.com:443）: " input_you
-        read -r -p "请输入要反代的 Emby 主地址（登录/API 地址）: " input_r
+        if [[ $proxy_mode == local ]]; then
+            read -r -p "请输入本机服务 URL（例如 http://127.0.0.1:3000）: " input_r
+        else
+            read -r -p "请输入要反代的 Emby 主地址（登录/API 地址）: " input_r
+        fi
         process_url_input "$input_you" you
         process_url_input "$input_r" r
     fi
@@ -1466,7 +1547,7 @@ prompt_interactive_mode() {
     # Preserve the original behavior: when -y and -r are both supplied, the
     # script remains fully non-interactive. Streaming URLs can then be supplied
     # with repeated -s/--stream-domain options.
-    if [[ $entered_interactive_mode == yes ]]; then
+    if [[ $entered_interactive_mode == yes && $proxy_mode == emby ]]; then
         echo
         echo -e "${BLUE}可选：添加独立的推流/CDN 源站。${NC}"
         echo "可连续输入多个完整 URL；不需要添加或输入完毕时，直接回车结束。"
@@ -1482,8 +1563,8 @@ prompt_interactive_mode() {
        ! is_ip_address "$you_domain" && [[ -x $SNI_ROUTER_BIN ]]; then
         local share_answer=''
         echo
-        echo -e "${BLUE}检测到 sb.sh，可由 HAProxy 按 SNI 让 Emby 与 Reality 复用公网 443。${NC}"
-        echo "要求 Emby 域名与 Reality SNI 不同；Nginx 将只监听 ${SNI_ROUTER_BACKEND_HOST}:${SNI_ROUTER_BACKEND_PORT}。"
+        echo -e "${BLUE}检测到 sb.sh，可由 HAProxy 按 SNI 让 HTTPS 服务与 Reality 复用公网 443。${NC}"
+        echo "要求当前域名与 Reality SNI 不同；Nginx 将只监听 ${SNI_ROUTER_BACKEND_HOST}:${SNI_ROUTER_BACKEND_PORT}。"
         read -r -p '是否启用 443 SNI 分流？[Y/n]: ' share_answer
         if [[ ! $share_answer =~ ^[Nn]$ ]]; then
             frontend_mode=haproxy
@@ -1543,15 +1624,20 @@ display_summary() {
 
     echo -e "\n${BLUE}Nginx 反代配置摘要${NC}"
     echo '──────────────────────────────────────────────'
+    echo "反代类型: $([[ $proxy_mode == local ]] && echo '本机服务' || echo 'Emby')"
     echo -e "前端访问: ${GREEN}${front_proto}://${you_domain}:${you_frontend_port}${you_domain_path}${NC}"
-    echo -e "Emby 主站: ${YELLOW}${upstream_proto}://${r_domain}:${r_frontend_port}${r_domain_path}${NC}"
-    if ((${#stream_origins[@]})); then
-        echo '推流源站:'
-        for i in "${!stream_origins[@]}"; do
-            echo "  $((i + 1)). ${stream_origins[$i]}"
-        done
+    if [[ $proxy_mode == local ]]; then
+        echo -e "本机服务: ${YELLOW}${upstream_proto}://${r_domain}:${r_frontend_port}${r_domain_path}${NC}"
     else
-        echo '推流源站: 未单独配置，将仅代理主站'
+        echo -e "Emby 主站: ${YELLOW}${upstream_proto}://${r_domain}:${r_frontend_port}${r_domain_path}${NC}"
+        if ((${#stream_origins[@]})); then
+            echo '推流源站:'
+            for i in "${!stream_origins[@]}"; do
+                echo "  $((i + 1)). ${stream_origins[$i]}"
+            done
+        else
+            echo '推流源站: 未单独配置，将仅代理主站'
+        fi
     fi
     echo "证书域名: $format_cert_domain"
     echo "DNS resolver: $resolver"
@@ -1945,6 +2031,7 @@ append_stream_proxy_redirects() {
 
 append_common_proxy_headers() {
     local file=$1
+    local profile=${2:-emby}
     cat >> "$file" <<'EOF'
         proxy_http_version 1.1;
         proxy_ssl_server_name on;
@@ -1955,10 +2042,20 @@ append_common_proxy_headers() {
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header X-Forwarded-Host $host;
         proxy_set_header X-Forwarded-Port $emby_public_port;
+EOF
+    if [[ $profile == local ]]; then
+        cat >> "$file" <<'EOF'
+        proxy_connect_timeout 10s;
+        proxy_send_timeout 3600s;
+        proxy_read_timeout 3600s;
+EOF
+    else
+        cat >> "$file" <<'EOF'
         proxy_connect_timeout 60s;
         proxy_send_timeout 3600s;
         proxy_read_timeout 3600s;
 EOF
+    fi
     if [[ $upstream_tls_verify == yes ]]; then
         cat >> "$file" <<'EOF'
         proxy_ssl_verify on;
@@ -2023,8 +2120,13 @@ EOF
 
     {
         echo '# Generated by deploy-stream-domains.sh'
-        echo '# Main upstream and fixed streaming upstreams are explicitly listed.'
+        if [[ $proxy_mode == local ]]; then
+            echo '# Loopback local-service upstream managed by nginxproxy.'
+        else
+            echo '# Main upstream and fixed streaming upstreams are explicitly listed.'
+        fi
         echo '# nginxproxy-link-version: 1'
+        echo "# nginxproxy-mode: ${proxy_mode}"
         echo "# nginxproxy-frontend: ${frontend_url}"
         echo "# nginxproxy-main: ${main_url}"
         for metadata_index in "${!stream_origins[@]}"; do
@@ -2063,6 +2165,7 @@ EOF
         fi
         echo "    set \$emby_public_host '${you_domain}';"
         echo "    set \$emby_public_port '${you_frontend_port}';"
+        echo '    server_tokens off;'
         echo
         if [[ $no_tls != yes ]]; then
             echo "    ssl_certificate /etc/nginx/certs/${format_cert_domain}/cert;"
@@ -2074,11 +2177,79 @@ EOF
         fi
         echo "    resolver ${resolver};"
         echo '    resolver_timeout 5s;'
-        echo '    client_max_body_size 500m;'
-        echo '    client_header_timeout 1h;'
-        echo '    keepalive_timeout 30m;'
+        echo '    client_max_body_size 100m;'
+        echo '    client_header_timeout 60s;'
+        echo '    keepalive_timeout 75s;'
         echo
     } >> "$tmp_conf"
+
+    if [[ $proxy_mode == local ]]; then
+        {
+            echo '    # Loopback-only local HTTP service.'
+            if [[ $front_path != / ]]; then
+                echo "    location = \"${front_exact}\" {"
+                echo "        return 308 \"${front_exact}/\$is_args\$args\";"
+                echo '    }'
+                echo
+            fi
+            echo "    location \"${front_path}\" {"
+            echo "        set \$local_service_upstream '${main_upstream}';"
+            if [[ $front_path != / ]]; then
+                echo "        rewrite ^${front_path_regex}(.*)\$ \"${main_base_path}/\$1\" break;"
+            elif [[ -n $main_base_path ]]; then
+                echo "        rewrite ^/(.*)\$ \"${main_base_path}/\$1\" break;"
+            fi
+            echo '        proxy_pass $local_service_upstream;'
+            echo '        proxy_set_header Host $host;'
+            if [[ $front_path != / ]]; then
+                echo "        proxy_set_header X-Forwarded-Prefix '${front_exact}';"
+            fi
+        } >> "$tmp_conf"
+        append_common_proxy_headers "$tmp_conf" local
+        cat >> "$tmp_conf" <<'EOF'
+        # Compatible with WebSocket, SSE, long polling and streamed responses.
+        proxy_buffering off;
+        proxy_max_temp_file_size 0;
+EOF
+        if [[ $no_proxy_redirect != yes ]]; then
+            local local_origin="${main_proto}://${r_domain}:${r_frontend_port}${main_base_path}"
+            local local_origin_no_port=$local_origin
+            local default_local_port
+            default_local_port=$(get_default_port "$main_proto")
+            if [[ $r_frontend_port == "$default_local_port" ]]; then
+                local_origin_no_port="${main_proto}://${r_domain}${main_base_path}"
+            fi
+            {
+                printf "        proxy_redirect '%s/' '\$scheme://\$emby_public_host:\$emby_public_port%s/';\n" "$local_origin" "${front_path%/}"
+                if [[ $local_origin_no_port != "$local_origin" ]]; then
+                    printf "        proxy_redirect '%s/' '\$scheme://\$emby_public_host:\$emby_public_port%s/';\n" "$local_origin_no_port" "${front_path%/}"
+                fi
+            } >> "$tmp_conf"
+        fi
+        {
+            echo '    }'
+            echo '}'
+        } >> "$tmp_conf"
+
+        backup_file "$conf_path"
+        stage_file_install "$tmp_conf" "$conf_path"
+        rm -f "$tmp_conf"
+        log_success "本机服务配置文件已生成: $conf_path"
+        return 0
+    fi
+
+    # A stable, non-redirecting root makes an HTTPS Emby domain suitable as a
+    # Reality handshake target while leaving the Emby Web UI available at /web/.
+    if [[ $front_path == / ]]; then
+        cat >> "$tmp_conf" <<'EOF'
+    location = / {
+        default_type text/html;
+        add_header Cache-Control "no-store";
+        return 200 '<!doctype html><html><head><meta charset="utf-8"><title>Welcome</title></head><body><h1>Welcome</h1><p><a href="/web/">Continue</a></p></body></html>';
+    }
+
+EOF
+    fi
 
     # Fixed, numbered streaming proxy locations.
     local i id proto domain port base_path upstream
@@ -2133,6 +2304,14 @@ EOF
         echo '        proxy_set_header Host $proxy_host;'
     } >> "$tmp_conf"
     append_common_proxy_headers "$tmp_conf"
+    cat >> "$tmp_conf" <<'EOF'
+        # Emby may serve video from the main origin when no separate CDN is used.
+        proxy_set_header Range $http_range;
+        proxy_set_header If-Range $http_if_range;
+        proxy_force_ranges on;
+        proxy_buffering off;
+        proxy_max_temp_file_size 0;
+EOF
     append_body_filter_preamble "$tmp_conf"
     append_stream_proxy_redirects "$tmp_conf"
 
@@ -2172,17 +2351,53 @@ test_and_reload_nginx() {
     reload_or_start_nginx
 }
 
-verify_sni_frontend() {
-    [[ $frontend_mode == haproxy ]] || return 0
-    local output
+verify_https_frontend() {
+    [[ $no_tls == yes ]] && return 0
+    local connect_port=$you_frontend_port clean_host=${you_domain//[\[\]]/} output status headers
+    local -a verify_name_args=()
+    [[ $frontend_mode == haproxy ]] && connect_port=443
+    if is_ip_address "$you_domain"; then
+        verify_name_args=(-verify_ip "$clean_host")
+    else
+        verify_name_args=(-verify_hostname "$clean_host")
+    fi
+
     output=$(printf '\n' | timeout 12 openssl s_client \
-        -connect "127.0.0.1:443" -servername "$you_domain" \
-        -verify_hostname "$you_domain" 2>&1 || true)
-    if ! grep -Fq 'Verify return code: 0 (ok)' <<<"$output"; then
-        log_error "HAProxy -> Nginx 的 TLS/SNI 端到端验证失败: $you_domain"
+        -connect "127.0.0.1:${connect_port}" -servername "$clean_host" \
+        -tls1_3 -alpn h2 -verify_return_error "${verify_name_args[@]}" 2>&1 || true)
+    if ! grep -Fq 'TLSv1.3' <<<"$output"; then
+        log_error "HTTPS 前端未协商 TLS 1.3: $clean_host"
         return 1
     fi
-    log_success 'HAProxy -> Nginx 的 TLS/SNI 端到端验证通过。'
+    if ! grep -Fq 'ALPN protocol: h2' <<<"$output"; then
+        log_error "HTTPS 前端未协商 HTTP/2 (h2): $clean_host"
+        return 1
+    fi
+    if ! grep -Eq 'Verify return code: 0 \(ok\)|Verification: OK' <<<"$output"; then
+        log_error "HTTPS 前端证书与域名不匹配或证书链无效: $clean_host"
+        return 1
+    fi
+
+    if [[ $proxy_mode == emby ]] && ! is_ip_address "$you_domain"; then
+        headers=$(curl -sSI --noproxy '*' --connect-timeout 4 --max-time 8 \
+            --resolve "${clean_host}:${connect_port}:127.0.0.1" \
+            "https://${clean_host}:${connect_port}/" 2>/dev/null) || {
+                log_error 'Reality 兼容性检查失败：无法读取 HTTPS 根路径。'
+                return 1
+            }
+        status=$(awk 'toupper($1) ~ /^HTTP\// {code=$2} END {print code}' <<<"$headers")
+        if [[ $status =~ ^3[0-9][0-9]$ ]]; then
+            log_error "Reality 兼容性检查失败：根路径返回 HTTP ${status} 跳转。"
+            return 1
+        fi
+        if [[ ! $status =~ ^[245][0-9][0-9]$ ]]; then
+            log_error "Reality 兼容性检查失败：无法确认根路径 HTTP 状态 (${status:-无})。"
+            return 1
+        fi
+        log_success "Reality 目标条件通过: TLS 1.3 / h2 / 根路径 HTTP ${status} 无跳转。"
+    else
+        log_success 'HTTPS 前端已通过 TLS 1.3、HTTP/2 与证书验证。'
+    fi
 }
 
 remove_acme_ecc_record_and_files() {
@@ -2313,6 +2528,10 @@ remove_domain_config() {
 
 
 validate_nginx_features() {
+    if [[ $no_tls != yes ]] && ! nginx -V 2>&1 | grep -q -- '--with-http_v2_module'; then
+        log_error '当前 Nginx 未编译 ngx_http_v2_module，无法保证 HTTP/2。'
+        return 1
+    fi
     if ((${#stream_origins[@]})) && ! nginx -V 2>&1 | grep -q -- '--with-http_sub_module'; then
         log_error "当前 Nginx 未编译 ngx_http_sub_module，无法改写 JSON/M3U8 中的推流 URL。"
         log_error "请安装带 --with-http_sub_module 的 Nginx 后重试。"
@@ -2327,6 +2546,11 @@ validate_nginx_features() {
 run_proxy_deployment() {
     prompt_interactive_mode
     [[ -n $you_domain && -n $r_domain ]] || { log_error '前端和主源站不能为空。'; exit 1; }
+    if [[ $proxy_mode == local && $no_tls == yes ]]; then
+        log_error '本机服务模式要求 HTTPS 前端，以保证 TLS 1.3 与 HTTP/2。'
+        exit 1
+    fi
+    validate_local_service_upstream || exit 1
     display_summary
     install_dependencies
     validate_nginx_features
@@ -2352,7 +2576,7 @@ run_proxy_deployment() {
 
     if ! register_sni_route || \
        { [[ $frontend_mode == haproxy ]] && ! sni_router_call check; } || \
-       ! verify_sni_frontend; then
+       ! verify_https_frontend; then
         rollback_new_sni_route || true
         rollback_config_changes || true
         restore_nginx_after_rollback
@@ -2385,26 +2609,30 @@ main_menu() {
         fi
         echo -e "${BLUE}"
         echo '  ╔═══════════════════════════════════════╗'
-        echo '  ║          Nginx Emby 反代管理          ║'
+        echo '  ║            Nginx 反代管理             ║'
         echo '  ╚═══════════════════════════════════════╝'
         echo -e "${NC}"
         echo -e "  版本: ${GREEN}${SCRIPT_VERSION}${NC}"
         echo
-        echo -e "    ${GREEN}[1]${NC} 添加反代"
-        echo -e "    ${GREEN}[2]${NC} 查看现有反代链路"
-        echo -e "    ${GREEN}[3]${NC} 更改或删除反代链路"
-        echo -e "    ${GREEN}[4]${NC} 检查并更新脚本"
-        echo -e "    ${RED}[5]${NC} 卸载反代管理脚本"
+        echo -e "    ${GREEN}[1]${NC} 添加 Emby 反代"
+        echo -e "    ${GREEN}[2]${NC} 添加本机服务反代"
+        echo -e "    ${GREEN}[3]${NC} 查看现有反代链路"
+        echo -e "    ${GREEN}[4]${NC} 更改或删除反代链路"
+        echo -e "    ${GREEN}[5]${NC} 检查并更新脚本"
+        echo -e "    ${RED}[6]${NC} 卸载反代管理脚本"
         echo
         echo -e "    ${YELLOW}[0]${NC} 退出"
         echo
-        if ! read -r -p '  请输入选项 [0-5]: ' choice; then
+        if ! read -r -p '  请输入选项 [0-6]: ' choice; then
             echo
             return 0
         fi
 
         case $choice in
             1)
+                reset_proxy_inputs
+                proxy_mode=emby
+                frontend_mode_explicit=no
                 run_proxy_deployment
                 pause_for_menu
                 if [[ -x $QUICK_COMMAND_PATH ]]; then
@@ -2413,21 +2641,32 @@ main_menu() {
                 return 0
                 ;;
             2)
+                reset_proxy_inputs
+                proxy_mode=local
+                frontend_mode_explicit=no
+                run_proxy_deployment
+                pause_for_menu
+                if [[ -x $QUICK_COMMAND_PATH ]]; then
+                    exec "$QUICK_COMMAND_PATH"
+                fi
+                return 0
+                ;;
+            3)
                 link_transfer_menu
                 pause_for_menu
                 ;;
-            3)
+            4)
                 manage_existing_link
                 pause_for_menu
                 ;;
-            4)
+            5)
                 if update_script && [[ $script_update_performed == yes ]]; then
                     log_info '正在重新载入新版脚本...'
                     exec "$QUICK_COMMAND_PATH"
                 fi
                 pause_for_menu
                 ;;
-            5)
+            6)
                 if uninstall_quick_command; then
                     return 0
                 fi
