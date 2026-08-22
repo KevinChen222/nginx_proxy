@@ -40,7 +40,7 @@ ACME_NGINX_PRE_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev
 ACME_NGINX_POST_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; elif [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then :; else nginx; fi'
 ACME_NGINX_RELOAD_CMD='if [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s reload; elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; else nginx; fi'
 
-SCRIPT_VERSION='2026.08.22-local1'
+SCRIPT_VERSION='2026.08.22-local2'
 SCRIPT_DOWNLOAD_URL='https://raw.githubusercontent.com/KevinChen222/nginx_proxy/refs/heads/main/deploy.sh'
 QUICK_COMMAND_PATH='/usr/local/bin/nginxproxy'
 QUICK_COMMAND_MARKER='# NGINXPROXY_MANAGED_COMMAND=1'
@@ -1802,7 +1802,10 @@ install_acme() {
         log_error 'acme.sh 归档结构无效。'
         return 1
     }
-    HOME=$ROOT_HOME sh "$source_dir/acme.sh" --install || install_status=$?
+    (
+        cd "$source_dir"
+        HOME=$ROOT_HOME sh ./acme.sh --install
+    ) || install_status=$?
     rm -f "$archive"
     cleanup_acme_extract_dir "$extract_dir"
     (( install_status == 0 )) || return "$install_status"
