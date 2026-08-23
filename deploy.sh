@@ -40,7 +40,7 @@ ACME_NGINX_PRE_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev
 ACME_NGINX_POST_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; elif [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then :; else nginx; fi'
 ACME_NGINX_RELOAD_CMD='if [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s reload; elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; else nginx; fi'
 
-SCRIPT_VERSION='2026.08.23-local6'
+SCRIPT_VERSION='2026.08.23-local7'
 SCRIPT_DOWNLOAD_URL='https://raw.githubusercontent.com/KevinChen222/nginx_proxy/refs/heads/main/deploy.sh'
 QUICK_COMMAND_PATH='/usr/local/bin/nginxproxy'
 QUICK_COMMAND_MARKER='# NGINXPROXY_MANAGED_COMMAND=1'
@@ -3045,8 +3045,10 @@ main_menu() {
         echo
         echo -e "    ${GREEN}[1]${NC} 添加 Emby 反代"
         echo -e "    ${GREEN}[2]${NC} 添加本机服务反代"
+        echo
         echo -e "    ${GREEN}[3]${NC} 查看现有反代链路"
         echo -e "    ${GREEN}[4]${NC} 更改或删除反代链路"
+        echo
         echo -e "    ${GREEN}[5]${NC} 检查并更新脚本"
         echo -e "    ${RED}[6]${NC} 卸载反代管理脚本"
         echo
