@@ -40,7 +40,7 @@ ACME_NGINX_PRE_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev
 ACME_NGINX_POST_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; elif [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then :; else nginx; fi'
 ACME_NGINX_RELOAD_CMD='if [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s reload; elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; else nginx; fi'
 
-SCRIPT_VERSION='2026.08.23-local5'
+SCRIPT_VERSION='2026.08.23-local6'
 SCRIPT_DOWNLOAD_URL='https://raw.githubusercontent.com/KevinChen222/nginx_proxy/refs/heads/main/deploy.sh'
 QUICK_COMMAND_PATH='/usr/local/bin/nginxproxy'
 QUICK_COMMAND_MARKER='# NGINXPROXY_MANAGED_COMMAND=1'
@@ -858,6 +858,30 @@ start_nginx() {
         return
     fi
     nginx
+}
+
+ensure_cron_service() {
+    local cron_service
+    if has_systemd; then
+        for cron_service in cron crond; do
+            if systemctl cat "${cron_service}.service" >/dev/null 2>&1; then
+                if ! systemctl enable --now "${cron_service}.service" >/dev/null 2>&1; then
+                    log_warn "无法启用 ${cron_service}.service；证书自动续期任务可能不会执行。"
+                fi
+                return 0
+            fi
+        done
+    elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
+        for cron_service in dcron crond cron; do
+            if [[ -x /etc/init.d/$cron_service ]]; then
+                rc-update add "$cron_service" default >/dev/null 2>&1 || true
+                rc-service "$cron_service" start >/dev/null 2>&1 || \
+                    log_warn "无法启动 ${cron_service}；证书自动续期任务可能不会执行。"
+                return 0
+            fi
+        done
+    fi
+    log_warn '未找到可管理的 cron 服务；请确认 acme.sh 的自动续期任务会被系统执行。'
 }
 
 reload_or_start_nginx() {
@@ -2029,6 +2053,7 @@ install_dependencies() {
     if [[ $dependencies_ready == yes ]]; then
         log_info "Nginx 和依赖已安装，跳过软件包安装。"
         $SUDO mkdir -p /etc/nginx/conf.d /etc/nginx/certs "$BACKUP_DIR" "$ACME_WEBROOT/.well-known/acme-challenge"
+        ensure_cron_service
         if ! nginx_is_running; then
             start_nginx || log_warn 'Nginx 当前未运行；将在配置完成后再次尝试启动。'
         fi
@@ -2079,6 +2104,7 @@ install_dependencies() {
     if has_systemd; then
         $SUDO systemctl enable nginx >/dev/null 2>&1 || true
     fi
+    ensure_cron_service
     if ! nginx_is_running; then
         start_nginx || log_warn 'Nginx 当前未运行；将在配置完成后再次尝试启动。'
     fi
