@@ -40,7 +40,7 @@ ACME_NGINX_PRE_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev
 ACME_NGINX_POST_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; elif [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then :; else nginx; fi'
 ACME_NGINX_RELOAD_CMD='if [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s reload; elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; else nginx; fi'
 
-SCRIPT_VERSION='2026.08.22-local4'
+SCRIPT_VERSION='2026.08.23-local5'
 SCRIPT_DOWNLOAD_URL='https://raw.githubusercontent.com/KevinChen222/nginx_proxy/refs/heads/main/deploy.sh'
 QUICK_COMMAND_PATH='/usr/local/bin/nginxproxy'
 QUICK_COMMAND_MARKER='# NGINXPROXY_MANAGED_COMMAND=1'
@@ -538,24 +538,28 @@ EOF_HAPROXY_GLOBAL
         fi
         cat <<'EOF_HAPROXY_INSPECT'
     tcp-request inspect-delay 5s
-    tcp-request content accept if { req.ssl_hello_type 1 }
+    acl sb_tls_client_hello req.ssl_hello_type 1
 EOF_HAPROXY_INSPECT
 
         local domain index=0 conditions='' i
         while IFS= read -r domain; do
             [[ -n $domain ]] || continue
             echo "    acl sb_https_${index} req.ssl_sni -i ${domain}"
-            echo "    use_backend sb_https_backend if sb_https_${index}"
             ((index += 1))
         done < <(jq -r '.https_routes | keys[]?' "$SNI_ROUTER_STATE_FILE")
 
-        if [[ -n $reality_host && -n $reality_port ]]; then
-            echo '    default_backend sb_reality_backend'
-        elif (( index > 0 )); then
+        if [[ -z $reality_host && -z $reality_port ]] && (( index > 0 )); then
             for ((i = 0; i < index; i++)); do
                 conditions+=" !sb_https_${i}"
             done
-            echo "    tcp-request content reject if${conditions}"
+            echo "    tcp-request content reject if sb_tls_client_hello${conditions}"
+        fi
+        echo '    tcp-request content accept if sb_tls_client_hello'
+        for ((i = 0; i < index; i++)); do
+            echo "    use_backend sb_https_backend if sb_https_${i}"
+        done
+        if [[ -n $reality_host && -n $reality_port ]]; then
+            echo '    default_backend sb_reality_backend'
         fi
 
         if (( index > 0 )); then
